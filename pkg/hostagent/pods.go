@@ -249,18 +249,140 @@ func (agent *HostAgent) podChanged(podkey *string) {
 func (agent *HostAgent) podChangedLocked(podobj interface{}) {
 	pod := podobj.(*v1.Pod)
 	logger := podLogger(agent.log, pod)
-
+	
+	epMetaKey := fmt.Sprintf("%s/%s", pod.ObjectMeta.Namespace, pod.ObjectMeta.Name)
+	epUuid := string(pod.ObjectMeta.UID)
+	
 	if !podFilter(pod) {
-		delete(agent.opflexEps, string(pod.ObjectMeta.UID))
-		agent.syncEps()
+//		delete(agent.opflexEps, string(pod.ObjectMeta.UID))
+//		agent.syncEps()
+		agent.epDeleted(&epUuid)
 		return
 	}
+	
+	epGroup := &metadata.OpflexGroup{}
+	if egval, ok := pod.ObjectMeta.Annotations[metadata.CompEgAnnotation]; ok {
+		err := json.Unmarshal([]byte(egval), epGroup)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"EgAnnotation": egval,
+			}).Error("Could not decode annotation: ", err)
+		}
+	}
+	
+	secGroup := make([]metadata.OpflexGroup, 0)
+	if sgval, ok := pod.ObjectMeta.Annotations[metadata.CompSgAnnotation]; ok {
+		err := json.Unmarshal([]byte(sgval), &secGroup)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"SgAnnotation": sgval,
+			}).Error("Could not decode annotation: ", err)
+		}
+	}
+	epAttributes := pod.ObjectMeta.Labels
+	if epAttributes == nil {
+		epAttributes = make(map[string]string)
+	}
+	epAttributes["vm-name"] = pod.ObjectMeta.Name
+	epAttributes["namespace"] = pod.ObjectMeta.Namespace
 
-	id := fmt.Sprintf("%s/%s", pod.ObjectMeta.Namespace, pod.ObjectMeta.Name)
-	epmetadata, ok := agent.epMetadata[id]
+	agent.epChanged(&epUuid, &epMetaKey, epGroup, secGroup, epAttributes, logger)
+
+//	id := fmt.Sprintf("%s/%s", pod.ObjectMeta.Namespace, pod.ObjectMeta.Name)
+//	epmetadata, ok := agent.epMetadata[id]
+//	if !ok {
+//		logger.Debug("No metadata")
+//		delete(agent.opflexEps, string(pod.ObjectMeta.UID))
+//		agent.syncEps()
+//		return
+//	}
+//
+//	var neweps []*opflexEndpoint
+//
+//	for _, epmeta := range epmetadata {
+//		for _, iface := range epmeta.Ifaces {
+//			patchIntName, patchAccessName :=
+//				metadata.GetIfaceNames(iface.HostVethName)
+//
+//			ips := make([]string, 0)
+//			for _, ip := range iface.IPs {
+//				if ip.Address.IP == nil {
+//					continue
+//				}
+//				ips = append(ips, ip.Address.IP.String())
+//			}
+//
+//			epidstr := string(pod.ObjectMeta.UID) + "_" +
+//				epmeta.Id.ContId + "_" + iface.HostVethName
+//			ep := &opflexEndpoint{
+//				Uuid:              epidstr,
+//				MacAddress:        iface.Mac,
+//				IpAddress:         ips,
+//				AccessIface:       iface.HostVethName,
+//				AccessUplinkIface: patchAccessName,
+//				IfaceName:         patchIntName,
+//			}
+//
+//			ep.Attributes = pod.ObjectMeta.Labels
+//			if ep.Attributes == nil {
+//				ep.Attributes = make(map[string]string)
+//			}
+//			ep.Attributes["vm-name"] = pod.ObjectMeta.Name
+//			ep.Attributes["namespace"] = pod.ObjectMeta.Namespace
+//			ep.Attributes["interface-name"] = iface.HostVethName
+//
+//			if egval, ok := pod.ObjectMeta.Annotations[metadata.CompEgAnnotation]; ok {
+//				g := &metadata.OpflexGroup{}
+//				err := json.Unmarshal([]byte(egval), g)
+//				if err != nil {
+//					logger.WithFields(logrus.Fields{
+//						"EgAnnotation": egval,
+//					}).Error("Could not decode annotation: ", err)
+//				} else {
+//					ep.EgPolicySpace = g.PolicySpace
+//					ep.EndpointGroup = g.Name
+//				}
+//			}
+//			if sgval, ok := pod.ObjectMeta.Annotations[metadata.CompSgAnnotation]; ok {
+//				g := make([]metadata.OpflexGroup, 0)
+//				err := json.Unmarshal([]byte(sgval), &g)
+//				if err != nil {
+//					logger.WithFields(logrus.Fields{
+//						"SgAnnotation": sgval,
+//					}).Error("Could not decode annotation: ", err)
+//				} else {
+//					ep.SecurityGroup = g
+//				}
+//			}
+//
+//			neweps = append(neweps, ep)
+//		}
+//	}
+//
+//	existing, ok := agent.opflexEps[string(pod.ObjectMeta.UID)]
+//	if (ok && !reflect.DeepEqual(existing, neweps)) || !ok {
+//		logger.WithFields(logrus.Fields{
+//			"id": id,
+//			"ep": neweps,
+//		}).Debug("Updated endpoints for pod")
+//
+//		agent.opflexEps[string(pod.ObjectMeta.UID)] = neweps
+//
+//		agent.syncEps()
+//	}
+}
+
+func (agent *HostAgent) epChanged(epUuid *string, epMetaKey *string, epGroup *metadata.OpflexGroup,
+								 epSecGroups []metadata.OpflexGroup, epAttributes map[string]string,
+								 logger *logrus.Entry) {
+ 	if logger == nil {
+ 		logger = agent.log.WithFields(logrus.Fields{})
+ 	}
+ 	
+	epmetadata, ok := agent.epMetadata[*epMetaKey]
 	if !ok {
 		logger.Debug("No metadata")
-		delete(agent.opflexEps, string(pod.ObjectMeta.UID))
+		delete(agent.opflexEps, *epUuid)
 		agent.syncEps()
 		return
 	}
@@ -280,8 +402,7 @@ func (agent *HostAgent) podChangedLocked(podobj interface{}) {
 				ips = append(ips, ip.Address.IP.String())
 			}
 
-			epidstr := string(pod.ObjectMeta.UID) + "_" +
-				epmeta.Id.ContId + "_" + iface.HostVethName
+			epidstr := *epUuid + "_" + epmeta.Id.ContId + "_" + iface.HostVethName
 			ep := &opflexEndpoint{
 				Uuid:              epidstr,
 				MacAddress:        iface.Mac,
@@ -290,52 +411,38 @@ func (agent *HostAgent) podChangedLocked(podobj interface{}) {
 				AccessUplinkIface: patchAccessName,
 				IfaceName:         patchIntName,
 			}
-
-			ep.Attributes = pod.ObjectMeta.Labels
-			if ep.Attributes == nil {
-				ep.Attributes = make(map[string]string)
+			
+			ep.Attributes = make(map[string]string)
+			if epAttributes != nil {
+				for k, v := range epAttributes {
+					ep.Attributes[k] = v
+				}
 			}
-			ep.Attributes["vm-name"] = pod.ObjectMeta.Name
-			ep.Attributes["namespace"] = pod.ObjectMeta.Namespace
+
 			ep.Attributes["interface-name"] = iface.HostVethName
-
-			if egval, ok := pod.ObjectMeta.Annotations[metadata.CompEgAnnotation]; ok {
-				g := &metadata.OpflexGroup{}
-				err := json.Unmarshal([]byte(egval), g)
-				if err != nil {
-					logger.WithFields(logrus.Fields{
-						"EgAnnotation": egval,
-					}).Error("Could not decode annotation: ", err)
-				} else {
-					ep.EgPolicySpace = g.PolicySpace
-					ep.EndpointGroup = g.Name
-				}
-			}
-			if sgval, ok := pod.ObjectMeta.Annotations[metadata.CompSgAnnotation]; ok {
-				g := make([]metadata.OpflexGroup, 0)
-				err := json.Unmarshal([]byte(sgval), &g)
-				if err != nil {
-					logger.WithFields(logrus.Fields{
-						"SgAnnotation": sgval,
-					}).Error("Could not decode annotation: ", err)
-				} else {
-					ep.SecurityGroup = g
-				}
-			}
+			ep.EgPolicySpace = epGroup.PolicySpace
+			ep.EndpointGroup = epGroup.Name
+			ep.SecurityGroup = epSecGroups
 
 			neweps = append(neweps, ep)
 		}
 	}
 
-	existing, ok := agent.opflexEps[string(pod.ObjectMeta.UID)]
+	existing, ok := agent.opflexEps[*epUuid]
 	if (ok && !reflect.DeepEqual(existing, neweps)) || !ok {
 		logger.WithFields(logrus.Fields{
-			"id": id,
+			"id": epMetaKey,
 			"ep": neweps,
 		}).Debug("Updated endpoints for pod")
 
-		agent.opflexEps[string(pod.ObjectMeta.UID)] = neweps
+		agent.opflexEps[*epUuid] = neweps
+		agent.syncEps()
+	}
+}
 
+func (agent *HostAgent) epDeleted(epUuid *string) {
+	if _, ok := agent.opflexEps[*epUuid]; ok {
+		delete(agent.opflexEps, *epUuid)
 		agent.syncEps()
 	}
 }
@@ -350,8 +457,9 @@ func (agent *HostAgent) podDeleted(obj interface{}) {
 func (agent *HostAgent) podDeletedLocked(obj interface{}) {
 	pod := obj.(*v1.Pod)
 	u := string(pod.ObjectMeta.UID)
-	if _, ok := agent.opflexEps[u]; ok {
-		delete(agent.opflexEps, u)
-		agent.syncEps()
-	}
+//	if _, ok := agent.opflexEps[u]; ok {
+//		delete(agent.opflexEps, u)
+//		agent.syncEps()
+//	}
+	agent.epDeleted(&u)
 }

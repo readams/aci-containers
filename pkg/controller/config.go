@@ -25,13 +25,24 @@ type OpflexGroup struct {
 	Name        string `json:"name,omitempty"`
 }
 
+const (
+	ENV_K8S string = "k8s"
+	ENV_CF string = "cf"
+)
+
 // Configuration for the controller
 type ControllerConfig struct {
+	// Orchestration environment type
+	EnvType string `json:"env-type,omitempty"`
+
 	// Log level
 	LogLevel string `json:"log-level,omitempty"`
 
 	// Absolute path to a kubeconfig file
 	KubeConfig string `json:"kubeconfig,omitempty"`
+
+	// Absolute path to CloudFoundry-specific config file
+	CfConfig string `json:"cfconfig,omitempty"`
 
 	// TCP port to run status server on (or 0 to disable)
 	StatusPort int `json:"status-port,omitempty"`
@@ -145,9 +156,13 @@ func NewConfig() *ControllerConfig {
 }
 
 func InitFlags(config *ControllerConfig) {
+	flag.StringVar(&config.EnvType, "env-type", ENV_K8S, "Orchestration environment type")
+
 	flag.StringVar(&config.LogLevel, "log-level", "info", "Log level")
 
 	flag.StringVar(&config.KubeConfig, "kubeconfig", "", "Absolute path to a kubeconfig file")
+
+	flag.StringVar(&config.CfConfig, "cfconfig", "", "Absolute path to CloudFoundry-specific config file")
 
 	flag.IntVar(&config.StatusPort, "status-port", 8091, " TCP port to run status server on (or 0 to disable)")
 }

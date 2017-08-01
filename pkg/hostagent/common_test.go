@@ -18,6 +18,8 @@ import (
 	"github.com/Sirupsen/logrus"
 	"k8s.io/client-go/tools/cache"
 	framework "k8s.io/client-go/tools/cache/testing"
+	
+	md "github.com/noironetworks/aci-containers/pkg/metadata"
 )
 
 const nodename = "test-node"
@@ -32,6 +34,21 @@ type testHostAgent struct {
 	fakeServiceSource   *framework.FakeControllerSource
 }
 
+type fakeEnvironment struct {
+}
+
+func (env *fakeEnvironment) Init(agent *HostAgent) error {
+	return nil
+}
+
+func (env *fakeEnvironment) PrepareRun(stopCh <-chan struct{}) error {
+	return nil
+}
+
+func (env *fakeEnvironment) CniDeviceChanged(metadataKey *string, id *md.ContainerId) {}
+
+func (env *fakeEnvironment) CniDeviceDeleted(metadataKey *string, id *md.ContainerId) {}
+
 func testAgent() *testHostAgent {
 	log := logrus.New()
 	log.Level = logrus.DebugLevel
@@ -39,7 +56,7 @@ func testAgent() *testHostAgent {
 	agent := &testHostAgent{
 		HostAgent: *NewHostAgent(&HostAgentConfig{
 			NodeName: nodename,
-		}, log),
+		}, &fakeEnvironment{}, log),
 	}
 
 	agent.fakeNodeSource = framework.NewFakeControllerSource()

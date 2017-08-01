@@ -26,10 +26,7 @@ import (
 	"github.com/Sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/pkg/api/v1"
-	v1beta1 "k8s.io/client-go/pkg/apis/extensions/v1beta1"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -45,6 +42,7 @@ type serviceUpdateFunc func(*v1.Service) (*v1.Service, error)
 type AciController struct {
 	log    *logrus.Logger
 	config *ControllerConfig
+	env    Environment
 
 	defaultEg string
 	defaultSg string
@@ -112,10 +110,11 @@ func newNodePodNetMeta() *nodePodNetMeta {
 	}
 }
 
-func NewController(config *ControllerConfig, log *logrus.Logger) *AciController {
+func NewController(config *ControllerConfig, env Environment, log *logrus.Logger) *AciController {
 	return &AciController{
 		log:       log,
 		config:    config,
+		env:       env,
 		defaultEg: "",
 		defaultSg: "",
 
@@ -137,19 +136,7 @@ func NewController(config *ControllerConfig, log *logrus.Logger) *AciController 
 	}
 }
 
-func (cont *AciController) Init(kubeClient *kubernetes.Clientset,
-	netPolClient rest.Interface) {
-	cont.updatePod = func(pod *v1.Pod) (*v1.Pod, error) {
-		return kubeClient.CoreV1().Pods(pod.ObjectMeta.Namespace).Update(pod)
-	}
-	cont.updateNode = func(node *v1.Node) (*v1.Node, error) {
-		return kubeClient.CoreV1().Nodes().Update(node)
-	}
-	cont.updateServiceStatus = func(service *v1.Service) (*v1.Service, error) {
-		return kubeClient.CoreV1().
-			Services(service.ObjectMeta.Namespace).UpdateStatus(service)
-	}
-
+func (cont *AciController) Init() {
 	egdata, err := json.Marshal(cont.config.DefaultEg)
 	if err != nil {
 		cont.log.Error("Could not serialize default endpoint group")
@@ -167,19 +154,10 @@ func (cont *AciController) Init(kubeClient *kubernetes.Clientset,
 	cont.log.Debug("Initializing IPAM")
 	cont.initIpam()
 
-	cont.log.Debug("Initializing informers")
-	cont.initNodeInformerFromClient(kubeClient)
-	cont.initNamespaceInformerFromClient(kubeClient)
-	cont.initReplicaSetInformerFromClient(kubeClient)
-	cont.initDeploymentInformerFromClient(kubeClient)
-	cont.initPodInformerFromClient(kubeClient)
-	cont.initEndpointsInformerFromClient(kubeClient)
-	cont.initServiceInformerFromClient(kubeClient)
-	cont.initNetworkPolicyInformerFromRest(netPolClient)
-
-	cont.log.Debug("Initializing indexes")
-	cont.initDepPodIndex()
-	cont.initNetPolPodIndex()
+	err = cont.env.Init(cont)
+	if err != nil {
+		panic(err.Error())
+	}
 }
 
 func (cont *AciController) processQueue(queue workqueue.RateLimitingInterface,
@@ -224,8 +202,7 @@ func (cont *AciController) aciNameForKey(ktype string, key string) string {
 }
 
 func (cont *AciController) initStaticObjs() {
-	cont.initStaticNetPolObjs()
-	cont.initStaticServiceObjs()
+	cont.env.InitStaticAciObjects()
 	cont.apicConn.WriteApicObjects(cont.config.AciPrefix+"_static",
 		cont.globalStaticObjs())
 }
@@ -253,55 +230,10 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 		panic(err)
 	}
 
-	cont.log.Debug("Starting informers")
-	go cont.nodeInformer.Run(stopCh)
-	go cont.namespaceInformer.Run(stopCh)
-	cont.log.Info("Waiting for node/namespace cache sync")
-	cache.WaitForCacheSync(stopCh,
-		cont.nodeInformer.HasSynced, cont.namespaceInformer.HasSynced)
-	cont.indexMutex.Lock()
-	cont.nodeSyncEnabled = true
-	cont.indexMutex.Unlock()
-	cont.nodeFullSync()
-	cont.log.Info("Node/namespace cache sync successful")
-
-	go cont.endpointsInformer.Run(stopCh)
-	go cont.serviceInformer.Run(stopCh)
-	go cont.processQueue(cont.serviceQueue, cont.serviceInformer,
-		func(obj interface{}) bool {
-			return cont.handleServiceUpdate(obj.(*v1.Service))
-		}, stopCh)
-	cont.log.Debug("Waiting for service cache sync")
-	cache.WaitForCacheSync(stopCh,
-		cont.endpointsInformer.HasSynced,
-		cont.serviceInformer.HasSynced)
-	cont.indexMutex.Lock()
-	cont.serviceSyncEnabled = true
-	cont.indexMutex.Unlock()
-	cont.serviceFullSync()
-	cont.log.Info("Service cache sync successful")
-
-	go cont.replicaSetInformer.Run(stopCh)
-	go cont.deploymentInformer.Run(stopCh)
-	go cont.podInformer.Run(stopCh)
-	go cont.networkPolicyInformer.Run(stopCh)
-	go cont.processQueue(cont.podQueue, cont.podInformer,
-		func(obj interface{}) bool {
-			return cont.handlePodUpdate(obj.(*v1.Pod))
-		}, stopCh)
-	go cont.processQueue(cont.netPolQueue, cont.networkPolicyInformer,
-		func(obj interface{}) bool {
-			return cont.handleNetPolUpdate(obj.(*v1beta1.NetworkPolicy))
-		}, stopCh)
-
-	cont.log.Info("Waiting for cache sync for remaining objects")
-	cache.WaitForCacheSync(stopCh,
-		cont.namespaceInformer.HasSynced,
-		cont.replicaSetInformer.HasSynced,
-		cont.deploymentInformer.HasSynced,
-		cont.podInformer.HasSynced,
-		cont.networkPolicyInformer.HasSynced)
-	cont.log.Info("Cache sync successful")
+	err = cont.env.PrepareRun(stopCh)
+	if err != nil {
+		panic(err.Error())
+	}
 
 	cont.initStaticObjs()
 
@@ -313,6 +245,9 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 		var chans []chan struct{}
 		qs := []workqueue.RateLimitingInterface{
 			cont.podQueue, cont.netPolQueue, cont.serviceQueue,
+		}
+		if cont.config.EnvType == ENV_CF {
+			qs = make([]workqueue.RateLimitingInterface, 0)
 		}
 		for _, q := range qs {
 			c := make(chan struct{})
@@ -332,25 +267,36 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 	cont.apicConn.AddSubscriptionDn(fmt.Sprintf("uni/tn-%s/out-%s",
 		cont.config.AciVrfTenant, cont.config.AciL3Out),
 		[]string{"fvRsCons"})
-	vmmDn := fmt.Sprintf("comp/prov-%s/ctrlr-[%s]-%s/injcont",
-		"Kubernetes", cont.config.AciVmmDomain, cont.config.AciVmmController)
-	cont.apicConn.AddSubscriptionDn(vmmDn,
-		[]string{"vmmInjectedHost", "vmmInjectedNs",
-			"vmmInjectedContGrp", "vmmInjectedDepl",
-			"vmmInjectedSvc", "vmmInjectedReplSet"})
-	cont.apicConn.AddSubscriptionClass("opflexODev",
-		[]string{"opflexODev"},
-		fmt.Sprintf("and(eq(opflexODev.domName,\"%s\"),"+
-			"eq(opflexODev.ctrlrName,\"%s\"))",
-			cont.config.AciVmmDomain, cont.config.AciVmmController))
+	vmmpol := "Kubernetes"
+	if cont.config.EnvType == ENV_CF {
+		vmmpol = "OpenStack"
+		// TODO subscribe to vmmInjected objects for CF
+	} else {
+		vmmDn := fmt.Sprintf("comp/prov-%s/ctrlr-[%s]-%s/injcont",
+			vmmpol, cont.config.AciVmmDomain, cont.config.AciVmmController)
+		cont.apicConn.AddSubscriptionDn(vmmDn,
+			[]string{"vmmInjectedHost", "vmmInjectedNs",
+				"vmmInjectedContGrp", "vmmInjectedDepl",
+				"vmmInjectedSvc", "vmmInjectedReplSet"})
+	}
 
-	cont.apicConn.SetSubscriptionHooks("opflexODev",
-		func(obj apicapi.ApicObject) bool {
-			cont.opflexDeviceChanged(obj)
-			return true
-		},
-		func(dn string) {
-			cont.opflexDeviceDeleted(dn)
-		})
+	if cont.config.EnvType == ENV_CF {
+		// TODO subscribe to opflexODev objects for CF
+	} else {
+		cont.apicConn.AddSubscriptionClass("opflexODev",
+			[]string{"opflexODev"},
+			fmt.Sprintf("and(eq(opflexODev.domName,\"%s\"),"+
+				"eq(opflexODev.ctrlrName,\"%s\"))",
+				cont.config.AciVmmDomain, cont.config.AciVmmController))
+	
+		cont.apicConn.SetSubscriptionHooks("opflexODev",
+			func(obj apicapi.ApicObject) bool {
+				cont.opflexDeviceChanged(obj)
+				return true
+			},
+			func(dn string) {
+				cont.opflexDeviceDeleted(dn)
+			})
+	}
 	go cont.apicConn.Run(stopCh)
 }

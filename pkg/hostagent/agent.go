@@ -19,7 +19,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 
-	"k8s.io/client-go/kubernetes"
+//	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/noironetworks/aci-containers/pkg/ipam"
@@ -29,6 +29,7 @@ import (
 type HostAgent struct {
 	log    *logrus.Logger
 	config *HostAgentConfig
+	env    Environment
 
 	indexMutex sync.Mutex
 
@@ -52,10 +53,11 @@ type HostAgent struct {
 	netNsFuncChan chan func()
 }
 
-func NewHostAgent(config *HostAgentConfig, log *logrus.Logger) *HostAgent {
+func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) *HostAgent {
 	return &HostAgent{
 		log:            log,
 		config:         config,
+		env:            env,
 		opflexEps:      make(map[string][]*opflexEndpoint),
 		opflexServices: make(map[string]*opflexService),
 		epMetadata:     make(map[string]map[string]*md.ContainerMetadata),
@@ -67,7 +69,7 @@ func NewHostAgent(config *HostAgentConfig, log *logrus.Logger) *HostAgent {
 	}
 }
 
-func (agent *HostAgent) Init(kubeClient *kubernetes.Clientset) {
+func (agent *HostAgent) Init() {
 	agent.log.Debug("Initializing endpoint CNI metadata")
 	err := md.LoadMetadata(agent.config.CniMetadataDir,
 		agent.config.CniNetwork, &agent.epMetadata)
@@ -76,32 +78,21 @@ func (agent *HostAgent) Init(kubeClient *kubernetes.Clientset) {
 	}
 	agent.log.Info("Loaded cached endpoint CNI metadata: ", len(agent.epMetadata))
 
-	agent.log.Debug("Initializing informers")
-	agent.initNodeInformerFromClient(kubeClient)
-	agent.initPodInformerFromClient(kubeClient)
-	agent.initEndpointsInformerFromClient(kubeClient)
-	agent.initServiceInformerFromClient(kubeClient)
+	err = agent.env.Init(agent)
+	if err != nil {
+		panic(err.Error())
+	}
 }
 
 func (agent *HostAgent) Run(stopCh <-chan struct{}) {
-	agent.log.Debug("Starting node informer")
-	go agent.nodeInformer.Run(stopCh)
+	err := agent.env.PrepareRun(stopCh)
+	if err != nil {
+		panic(err.Error())
+	}
 
-	agent.log.Info("Waiting for node cache sync")
-	cache.WaitForCacheSync(stopCh, agent.nodeInformer.HasSynced)
-	agent.log.Info("Node cache sync successful")
-
-	agent.log.Debug("Starting remaining informers")
-	go agent.podInformer.Run(stopCh)
-	go agent.endpointsInformer.Run(stopCh)
-	go agent.serviceInformer.Run(stopCh)
-
-	agent.log.Info("Waiting for cache sync for remaining objects")
-	cache.WaitForCacheSync(stopCh,
-		agent.podInformer.HasSynced, agent.endpointsInformer.HasSynced,
-		agent.serviceInformer.HasSynced)
-	agent.log.Info("Cache sync successful")
-
+    if agent.config.PodNetworkRanges != "" {
+	    	agent.updateIpamAnnotation(agent.config.PodNetworkRanges)
+    }
 	agent.log.Debug("Building IP address management database")
 	agent.rebuildIpam()
 
@@ -119,7 +110,7 @@ func (agent *HostAgent) Run(stopCh <-chan struct{}) {
 	}
 
 	agent.log.Info("Starting endpoint RPC")
-	err := agent.runEpRPC(stopCh)
+	err = agent.runEpRPC(stopCh)
 	if err != nil {
 		panic(err.Error())
 	}

@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"io/ioutil"
 	"os"
@@ -23,10 +24,6 @@ import (
 	"github.com/Sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/noironetworks/aci-containers/pkg/controller"
 )
@@ -66,41 +63,27 @@ func main() {
 	log.Level = logLevel
 
 	log.WithFields(logrus.Fields{
-		"kubeconfig": config.KubeConfig,
-		"logLevel":   logLevel,
+		"logLevel": logLevel,
+		"env-type": config.EnvType,
 	}).Info("Starting")
 
-	log.Debug("Initializing kubernetes client")
-	var restconfig *restclient.Config
-	if config.KubeConfig != "" {
-		// use kubeconfig file from command line
-		restconfig, err = clientcmd.BuildConfigFromFlags("", config.KubeConfig)
-		if err != nil {
-			panic(err.Error())
-		}
+	var env controller.Environment
+	if config.EnvType == controller.ENV_K8S {
+		env, err = controller.NewK8sEnvironment(config, log)
+	} else if config.EnvType == controller.ENV_CF {
+		env, err = controller.NewCfEnvironment(config, log)
 	} else {
-		// creates the in-cluster config
-		restconfig, err = restclient.InClusterConfig()
-		if err != nil {
-			panic(err.Error())
-		}
+		err = errors.New("Unsupported environment-type " + config.EnvType)
+		log.Error(err)
 	}
 
-	// creates the client
-	kubeClient, err := kubernetes.NewForConfig(restconfig)
 	if err != nil {
+		log.Error("Environment set up failed for type ", config.EnvType)
 		panic(err.Error())
 	}
 
-	npconfig := *restconfig
-	controller.ConfigureNetPolClient(&npconfig)
-	netPolClient, err := rest.RESTClientFor(&npconfig)
-	if err != nil {
-		panic(err)
-	}
-
-	cont := controller.NewController(config, log)
-	cont.Init(kubeClient, netPolClient)
+	cont := controller.NewController(config, env, log)
+	cont.Init()
 	cont.Run(wait.NeverStop)
 	cont.RunStatus()
 }

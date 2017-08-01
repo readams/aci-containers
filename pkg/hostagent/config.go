@@ -32,6 +32,11 @@ type cniNetConfig struct {
 	Routes  []route        `json:"routes,omitempty"`
 }
 
+const (
+	ENV_K8S string = "k8s"
+	ENV_CF string = "cf"
+)
+
 type HostAgentNodeConfig struct {
 	// Uplink interface for this host
 	UplinkIface string `json:"uplink-iface,omitempty"`
@@ -53,11 +58,17 @@ type HostAgentNodeConfig struct {
 type HostAgentConfig struct {
 	HostAgentNodeConfig
 
+	// Orchestration environment type
+	EnvType string `json:"env-type,omitempty"`
+
 	// Log level
 	LogLevel string `json:"log-level,omitempty"`
 
 	// Absolute path to a kubeconfig file
 	KubeConfig string `json:"kubeconfig,omitempty"`
+	
+	// Absolute path to CloudFoundry-specific config file
+	CfConfig string `json:"cfconfig,omitempty"`
 
 	// Name of Kubernetes node on which this agent is running
 	NodeName string `json:"node-name,omitempty"`
@@ -86,6 +97,9 @@ type HostAgentConfig struct {
 	// Location of the endpoint RPC socket used for communicating with
 	// the CNI plugin
 	EpRpcSock string `json:"ep-rpc-sock,omitempty"`
+	
+	// Permissions to set for endpoint RPC socket file. Octal string. 
+	EpRpcSockPerms string `json:"ep-rpc-sock-perms,omitempty"`
 
 	// Name of the OVS integration bridge
 	IntBridgeName string `json:"int-bridge-name,omitempty"`
@@ -110,13 +124,21 @@ type HostAgentConfig struct {
 
 	// ACI Tenant containing the ACI VRF for this kubernetes instance
 	AciVrfTenant string `json:"aci-vrf-tenant,omitempty"`
+	
+	// Network ranges for allocating to containers/pods
+	PodNetworkRanges string `json:"pod-network-ranges,omitempty"`
 }
 
 func (config *HostAgentConfig) InitFlags() {
+	
+	flag.StringVar(&config.EnvType, "env-type", ENV_K8S, "Orchestration environment type")
+	
 	flag.StringVar(&config.LogLevel, "log-level", "info", "Log level")
 
 	flag.StringVar(&config.KubeConfig, "kubeconfig", "", "Absolute path to a kubeconfig file")
 	flag.StringVar(&config.NodeName, "node-name", "", "Name of Kubernetes node on which this agent is running")
+
+	flag.StringVar(&config.CfConfig, "cfconfig", "", "Absolute path to CloudFoundry-specific config file")
 
 	flag.IntVar(&config.StatusPort, "status-port", 8090, "TCP port to run status server on (or 0 to disable)")
 
@@ -129,6 +151,7 @@ func (config *HostAgentConfig) InitFlags() {
 
 	flag.StringVar(&config.OvsDbSock, "ovs-db-sock", "/usr/local/var/run/openvswitch/db.sock", "Location of the OVS DB socket")
 	flag.StringVar(&config.EpRpcSock, "ep-rpc-sock", "/usr/local/var/run/aci-containers-ep-rpc.sock", "Location of the endpoint RPC socket used for communicating with the CNI plugin")
+	flag.StringVar(&config.EpRpcSockPerms, "ep-rpc-sock-perms", "", "Permissions to set for endpoint RPC socket file. Octal string")
 
 	flag.StringVar(&config.IntBridgeName, "int-bridge-name", "br-int", "Name of the OVS integration bridge")
 	flag.StringVar(&config.AccessBridgeName, "access-bridge-name", "br-access", "Name of the OVS access bridge")
@@ -147,4 +170,7 @@ func (config *HostAgentConfig) InitFlags() {
 
 	flag.StringVar(&config.AciVrf, "aci-vrf", "kubernetes-vrf", "ACI VRF for this kubernetes instance")
 	flag.StringVar(&config.AciVrfTenant, "aci-vrf-tenant", "common", "ACI Tenant containing the ACI VRF for this kubernetes instance")
+	
+	flag.StringVar(&config.PodNetworkRanges, "pod-network-ranges", "",
+		           "Network ranges for allocating to containers/pods. JSON string.")
 }

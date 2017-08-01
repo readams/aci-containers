@@ -30,3 +30,22 @@ import:
   version: ~0.2.0
 - package: github.com/gorilla/websocket
   version: ^1.1.0
+- package: code.cloudfoundry.org/garden
+  subpackages:
+  - net_in
+  - net_out_rule
+- package: code.cloudfoundry.org/bbs
+- package: github.com/cloudfoundry-community/go-cfclient
+- package: github.com/coreos/etcd
+  version: ^3.2.4
+  subpackages:
+  - client
+- package: github.com/coreos/go-semver
+  version: ^0.2.0
+  subpackages:
+  - semver
+- package: code.cloudfoundry.org/cfhttp
+- package: github.com/gogo/protobuf
+  version: ^0.4.0
+  subpackages:
+  - protoc-gen-gogoslick

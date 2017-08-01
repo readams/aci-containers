@@ -24,6 +24,8 @@ import (
 	"runtime"
 	"time"
 
+	"code.cloudfoundry.org/garden"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/ns"
@@ -38,6 +40,8 @@ import (
 )
 
 var log = logrus.New()
+var logFile string
+var logFd os.File
 
 func init() {
 	// This ensures that main runs only on main thread (thread group leader).
@@ -47,15 +51,29 @@ func init() {
 }
 
 type K8SArgs struct {
-	types.CommonArgs
 	K8S_POD_NAME               types.UnmarshallableString
 	K8S_POD_NAMESPACE          types.UnmarshallableString
 	K8S_POD_INFRA_CONTAINER_ID types.UnmarshallableString
 }
 
+type CfMetadata struct {
+	PolicyGroupId string `json:"policy_group_id,omitempty"`
+	AppId string `json:"app_id,omitempty"`
+	SpaceId string `json:"space_id,omitempty"`
+	OrgId string `json:"org_id,omitempty"`
+}
+
+type CfRuntimeConfig struct {
+	PortMappings []garden.NetIn      `json:"portMappings"`
+	NetOutRules  []garden.NetOutRule `json:"netOutRules"`
+}
+
 type NetConf struct {
 	types.NetConf
+	RuntimeConfig  CfRuntimeConfig `json:"runtimeConfig,omitempty"`
+	CfMetadata     CfMetadata      `json:"metadata,omitempty"`
 	LogLevel       string `json:"log-level,omitempty"`
+	LogFile        string `json:"log-file,omitempty"`
 	WaitForNetwork bool   `json:"wait-for-network"`
 	EpRpcSock      string `json:"ep-rpc-sock,omitempty"`
 }
@@ -69,18 +87,39 @@ func loadConf(args *skel.CmdArgs) (*NetConf, *K8SArgs, string, error) {
 	}
 
 	log.Out = os.Stderr
+	if n.LogFile != "" {
+		logFd, err := os.OpenFile(n.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+		if err == nil {
+			log.Out = logFd
+			logFile = n.LogFile
+		} else {
+			log.Info("Failed to open log file, using stderr: ", err)
+		}
+	}
+
 	logLevel, err := logrus.ParseLevel(n.LogLevel)
 	if err == nil {
 		log.Level = logLevel
 	}
+
+	log.Debug("NetConf ", n)
+	stdinStr := string(args.StdinData)
+	log.Debug("StdinData ", stdinStr)
 
 	k8sArgs := &K8SArgs{}
 	err = types.LoadArgs(args.Args, k8sArgs)
 	if err != nil {
 		return nil, nil, "", err
 	}
+	
+	if k8sArgs.K8S_POD_NAME == "" {
+		k8sArgs.K8S_POD_NAMESPACE = "_cf_"
+		k8sArgs.K8S_POD_NAME = types.UnmarshallableString(args.ContainerID)
+	}
 
 	id := args.ContainerID
+	log.Debug("k8sArgs ", k8sArgs)
+	log.Debug("ContainerID ", id)
 
 	return n, k8sArgs, id, nil
 }
@@ -162,6 +201,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	logger := log.WithFields(logrus.Fields{
 		"id": id,
 	})
+	log.Info("CMD ADD")
 
 	// run the IPAM plugin and get back the config to apply
 	var result *current.Result
@@ -184,7 +224,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	} else {
 		result = &current.Result{}
 		result.DNS = n.DNS
-	}
+	} 
 
 	metadata := cnimd.ContainerMetadata{
 		Id: cnimd.ContainerId{
@@ -217,6 +257,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		waitForAllNetwork(result, id, 10*time.Second)
 	}
 
+	logger.Debug("ADD result: ", result)
 	return result.Print()
 }
 
@@ -225,10 +266,11 @@ func cmdDel(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
-
 	logger := log.WithFields(logrus.Fields{
 		"id": id,
 	})
+	log.Info("CMD DEL")
+
 
 	if n.IPAM.Type != "opflex-agent-cni-ipam" {
 		logger.Debug("Executing IPAM delete")
@@ -260,4 +302,8 @@ func cmdDel(args *skel.CmdArgs) error {
 func main() {
 	skel.PluginMain(cmdAdd, cmdDel,
 		version.PluginSupports("0.3.0", "0.3.1"))
+	
+	if logFile != "" {
+	    logFd.Close()
+	}
 }
