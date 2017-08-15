@@ -16,16 +16,20 @@ package controller
 
 import (
 	"encoding/json"
+	"fmt"
 	"errors"
 	"io/ioutil"
+	"net"
 	"net/url"
 	"sync"
+	"time"
 
 	"code.cloudfoundry.org/bbs"
 	"code.cloudfoundry.org/lager"
 
 	etcdclient "github.com/coreos/etcd/client"
 	"github.com/Sirupsen/logrus"
+	"golang.org/x/net/context"
 
 	"github.com/noironetworks/aci-containers/pkg/apicapi"
 	"github.com/noironetworks/aci-containers/pkg/cfapi"
@@ -39,6 +43,7 @@ type CfEnvironment struct {
 	bbsClient    bbs.Client
 	ccClient     *cfapi.CcClient
 	etcdClient   etcdclient.Client
+	netpolClient *cfapi.PolicyClient
 	cfLogger     lager.Logger
 
 	indexLock    sync.Locker
@@ -46,7 +51,9 @@ type CfEnvironment struct {
 	appIdx       map[string]AppInfo
 	spaceIdx     map[string]SpaceInfo
 	asgIdx       map[string]SecurityGroupInfo
+	netpolIdx    map[string]map[string][]cfapi.Destination
 
+	idxStatusChan   chan string
 	log          *logrus.Logger
 }
 
@@ -66,6 +73,12 @@ type CfConfig struct {
 	EtcdCACertFile                     string                `json:"etcd_ca_cert_file"`
 	EtcdClientCertFile                 string                `json:"etcd_client_cert_file"`
 	EtcdClientKeyFile                  string                `json:"etcd_client_key_file"`
+
+	NetPolApiUrl                       string                `json:"network_policy_api_url"`
+	NetPolCACertFile                   string                `json:"network_policy_ca_cert_file"`
+	NetPolClientCertFile               string                `json:"network_policy_client_cert_file"`
+	NetPolClientKeyFile                string                `json:"network_policy_client_key_file"`
+	NetPolPollingInterval              int                   `json:"network_policy_polling_interval_sec"`
 
 	AppPort                            string                `json:"app_port"`
 	SshPort                            string                `json:"ssh_port"`
@@ -93,6 +106,9 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 	}
 	if cfconfig.SshPort == "" {
 		cfconfig.SshPort = "2222"
+	}
+	if cfconfig.NetPolPollingInterval <= 0 {
+		cfconfig.NetPolPollingInterval = 1
 	}
 
 	log.WithFields(logrus.Fields{
@@ -123,14 +139,6 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 			return nil, err
 		}
 	}
-	
-
-	ccClient, err := cfapi.NewCcClient(cfconfig.CCApiUrl, cfconfig.CCApiUsername,
-									  cfconfig.CCApiPassword, log)
-	if err != nil {
-		log.Error("Failed to create CC API client: ", err)
-		return nil, err
-	}
 
 	etcdClient, err := etcd.NewEtcdClient(cfconfig.EtcdUrl, cfconfig.EtcdCACertFile,
 										 cfconfig.EtcdClientCertFile, cfconfig.EtcdClientKeyFile)
@@ -139,8 +147,18 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 		return nil, err
 	}
 
-	return &CfEnvironment{cfconfig: cfconfig, bbsClient: bbsClient, ccClient: ccClient,
-						 etcdClient: etcdClient, indexLock: &sync.Mutex{}, log: log}, nil
+	netpolClient, err := cfapi.NewNetPolClient(cfconfig.NetPolApiUrl,
+											  cfconfig.NetPolCACertFile,
+											  cfconfig.NetPolClientCertFile,
+											  cfconfig.NetPolClientKeyFile)
+	if err != nil {
+		log.Error("Failed to create network policy client: ", err)
+		return nil, err
+	}
+
+	return &CfEnvironment{cfconfig: cfconfig, bbsClient: bbsClient,
+						 etcdClient: etcdClient, netpolClient: netpolClient,
+						 indexLock: &sync.Mutex{}, log: log}, nil
 }
 
 func (env *CfEnvironment) Init(cont *AciController) error {
@@ -169,15 +187,52 @@ func (env *CfEnvironment) Init(cont *AciController) error {
 	env.appIdx = make(map[string]AppInfo)
 	env.spaceIdx = make(map[string]SpaceInfo)
 	env.asgIdx = make(map[string]SecurityGroupInfo)
+	env.netpolIdx = make(map[string]map[string][]cfapi.Destination)
 
+	env.idxStatusChan = make(chan string)
 	return nil
 }
 
 func (env *CfEnvironment) PrepareRun(stopCh <-chan struct{}) error {
-	appCh := make(chan AppUpdateInfo, 100)
+	maxattempts := 240                 // TODO move the connect loop to app-index builder
+	var err error
+	for env.ccClient == nil && maxattempts > 0 {
+		maxattempts--
+		ccClient, err := cfapi.NewCcClient(env.cfconfig.CCApiUrl, env.cfconfig.CCApiUsername,
+										  env.cfconfig.CCApiPassword, env.log)
+		if err != nil {
+			env.log.Error("Failed to create CC API client: ", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		env.log.Debug("CC API client created")
+		env.ccClient = ccClient
+	}
+	if env.ccClient == nil {
+		env.log.Error("Couldn't create CC API client, aborting: ", err)
+		return err
+	}
+
+	appCh := make(chan interface{}, 100)
 	go env.initBbsEventListener(appCh, stopCh)
 	go env.initBbsTaskListener(appCh, stopCh)
 	go env.initAppIndexBuilder(appCh, stopCh)
+	go env.initNetworkPolicyPoller(stopCh)
+	env.log.Info("Waiting for initial sync")
+	var idx_ready, net_pol_ready bool = false, false
+	for !idx_ready || !net_pol_ready {
+		select {
+		case <-stopCh:
+			return nil
+
+		case status := <-env.idxStatusChan:
+			idx_ready = idx_ready || (status == "index-ready")
+			net_pol_ready = net_pol_ready || (status == "net-policy-ready")
+			env.log.Debug(
+				fmt.Sprintf("Sync wait: index-ready %v, net-pol-ready %v", idx_ready, net_pol_ready))
+		}
+	}
+	env.log.Info("Initial sync complete")
 	return nil
 }
 
@@ -188,7 +243,7 @@ func (env *CfEnvironment) InitStaticAciObjects() {
 func (env *CfEnvironment) initStaticHpp() {
 	cont := env.cont
 
-	staticName := cont.aciNameForKey("asg", "static")
+	staticName := cont.aciNameForKey("hpp", "static")
 	hpp := apicapi.NewHostprotPol(cont.config.AciPolicyTenant, staticName)
 
 	// ARP ingress/egress and ICMP ingress (+ reply)
@@ -237,5 +292,49 @@ func (env *CfEnvironment) initStaticHpp() {
 	}
 	hpp.AddChild(appSubj)
 
+	// Allow TCP/UDP egress (+ reply) to CNI network
+	if env.cont.config.PodSubnet == "" {
+		env.log.Warning("Pod subnet not defined")
+	} else {
+		gw, subnet, err := net.ParseCIDR(env.cont.config.PodSubnet)
+		if err != nil {
+			env.log.Warning("Invalid pod subnet: ", err)
+		} else {
+			af := "ipv4"
+			if gw.To4() == nil && gw.To16() != nil {
+				af = "ipv6"
+			}
+			c2cSubj := apicapi.NewHostprotSubj(hpp.GetDn(), "c2c")
+			c2cDn := c2cSubj.GetDn()
+			tcp := apicapi.NewHostprotRule(c2cDn, "c2c-tcp")
+			tcp.SetAttr("direction", "egress")
+			tcp.SetAttr("ethertype", af)
+			tcp.SetAttr("protocol", "tcp")
+			tcp_remote := apicapi.NewHostprotRemoteIp(tcp.GetDn(), subnet.String())
+			tcp.AddChild(tcp_remote)
+			c2cSubj.AddChild(tcp)
+
+			udp := apicapi.NewHostprotRule(c2cDn, "c2c-udp")
+			udp.SetAttr("direction", "egress")
+			udp.SetAttr("ethertype", af)
+			udp.SetAttr("protocol", "udp")
+			udp_remote := apicapi.NewHostprotRemoteIp(udp.GetDn(), subnet.String())
+			udp.AddChild(udp_remote)
+			c2cSubj.AddChild(udp)
+
+			hpp.AddChild(c2cSubj)
+		}
+	}
 	cont.apicConn.WriteApicObjects(cont.config.AciPrefix + "_asg_static", apicapi.ApicSlice{hpp})
+}
+
+func (env *CfEnvironment) NodePodNetworkChanged(nodename string) {
+	if podnet, ok := env.cont.nodePodNetCache[nodename]; ok {
+		cellKey := etcd.CELL_KEY_BASE + "/" + nodename
+		kapi := etcdclient.NewKeysAPI(env.etcdClient)
+		_, err := kapi.Set(context.Background(), cellKey + "/network", podnet.podNetIpsAnnotation, nil)
+		if err != nil {
+			env.log.Error("Error setting etcd net info for cell: ", err)
+		}
+	}
 }

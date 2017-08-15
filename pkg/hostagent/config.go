@@ -125,8 +125,8 @@ type HostAgentConfig struct {
 	// ACI Tenant containing the ACI VRF for this kubernetes instance
 	AciVrfTenant string `json:"aci-vrf-tenant,omitempty"`
 	
-	// Network ranges for allocating to containers/pods
-	PodNetworkRanges string `json:"pod-network-ranges,omitempty"`
+//	// Network ranges for allocating to containers/pods
+//	PodNetworkRanges string `json:"pod-network-ranges,omitempty"`
 }
 
 func (config *HostAgentConfig) InitFlags() {
@@ -171,6 +171,6 @@ func (config *HostAgentConfig) InitFlags() {
 	flag.StringVar(&config.AciVrf, "aci-vrf", "kubernetes-vrf", "ACI VRF for this kubernetes instance")
 	flag.StringVar(&config.AciVrfTenant, "aci-vrf-tenant", "common", "ACI Tenant containing the ACI VRF for this kubernetes instance")
 	
-	flag.StringVar(&config.PodNetworkRanges, "pod-network-ranges", "",
-		           "Network ranges for allocating to containers/pods. JSON string.")
+//	flag.StringVar(&config.PodNetworkRanges, "pod-network-ranges", "",
+//		           "Network ranges for allocating to containers/pods. JSON string.")
 }

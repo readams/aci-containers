@@ -30,6 +30,7 @@ type Environment interface {
 	Init(agent *AciController) error
 	PrepareRun(stopCh <-chan struct{}) error
 	InitStaticAciObjects()
+	NodePodNetworkChanged(nodeName string)
 }
 
 type K8sEnvironment struct {
@@ -113,6 +114,18 @@ func (env *K8sEnvironment) Init(cont *AciController) error {
 func (env *K8sEnvironment) InitStaticAciObjects() {
 	env.cont.initStaticNetPolObjs()
 	env.cont.initStaticServiceObjs()
+}
+
+func (env *K8sEnvironment) NodePodNetworkChanged(nodename string) {
+	node, exists, err :=
+		env.cont.nodeInformer.GetStore().GetByKey(nodename)
+	if err != nil {
+		env.cont.log.Error("Could not lookup node: ", err)
+		return
+	}
+	if exists && node != nil {
+		env.cont.nodeChanged(node)
+	}
 }
 
 func (env *K8sEnvironment) PrepareRun(stopCh <-chan struct{}) error {

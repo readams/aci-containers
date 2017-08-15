@@ -385,17 +385,7 @@ func (cont *AciController) checkNodePodNet(nodename string) {
 	}
 
 	if changed {
-		go func() {
-			node, exists, err :=
-				cont.nodeInformer.GetStore().GetByKey(nodename)
-			if err != nil {
-				cont.log.Error("Could not lookup node: ", err)
-				return
-			}
-			if exists && node != nil {
-				cont.nodeChanged(node)
-			}
-		}()
+		go cont.env.NodePodNetworkChanged(nodename)
 	}
 
 }

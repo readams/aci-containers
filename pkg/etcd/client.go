@@ -26,7 +26,6 @@ func NewEtcdClient(etcdUrl string, caCertFile string, clientCertFile string,
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     tlsConfig,
 	}
-	
 	cfg := client.Config{
 		Endpoints:               []string{etcdUrl},
 		Transport:               t,
@@ -48,7 +47,20 @@ type GroupInfo struct {
 
 type EpInfo struct {
 	AppId               string        `json:"app_id"`
+	AppName             string        `json:"app_name"`
+	InstanceIndex       int32         `json:"instance_index"`
 	EpgTenant           string        `json:"epg_tenant"`
 	Epg                 string        `json:"epg"`
 	SecurityGroups      []GroupInfo   `json:"sg"`
+}
+
+func FlattenNodes(nd *client.Node, nodes *client.Nodes) {
+	if nd == nil {
+		return
+	}
+
+	*nodes = append(*nodes, nd)
+	for _, n := range nd.Nodes {
+		FlattenNodes(n, nodes)
+	}
 }

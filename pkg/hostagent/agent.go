@@ -90,11 +90,11 @@ func (agent *HostAgent) Run(stopCh <-chan struct{}) {
 		panic(err.Error())
 	}
 
-    if agent.config.PodNetworkRanges != "" {
-	    	agent.updateIpamAnnotation(agent.config.PodNetworkRanges)
-    }
-	agent.log.Debug("Building IP address management database")
-	agent.rebuildIpam()
+//    if agent.config.PodNetworkRanges != "" {
+//	    	agent.updateIpamAnnotation(agent.config.PodNetworkRanges)
+//    }
+//	agent.log.Debug("Building IP address management database")
+//	agent.rebuildIpam()
 
 	if agent.config.OpFlexEndpointDir == "" ||
 		agent.config.OpFlexServiceDir == "" {

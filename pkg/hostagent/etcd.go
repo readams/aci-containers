@@ -16,30 +16,68 @@ package hostagent
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	
 	"golang.org/x/net/context"
 	etcdclient "github.com/coreos/etcd/client"
 	
 	"github.com/noironetworks/aci-containers/pkg/etcd"
+	"github.com/noironetworks/aci-containers/pkg/ipam"
+	"github.com/noironetworks/aci-containers/pkg/metadata"
 )
 
-func (env *CfEnvironment) processResponse(nd *etcdclient.Node, nodes *etcdclient.Nodes) {
-	if nd == nil {
-		return
+func isDeleteAction(action *string) bool {
+	return (*action == "delete" || *action == "compareAndDelete" || *action == "expire")
+}
+
+func (env *CfEnvironment) getDefaultIpPool() (string) {
+	ipa4 := ipam.New()
+	ipa6 := ipam.New()
+
+	for _, nc := range env.agent.config.NetConfig {
+		ip := nc.Subnet.IP.To4()
+		num_ones, _ := nc.Subnet.Mask.Size()
+		mask := net.CIDRMask(num_ones, 32)
+		gw := nc.Gateway.To4()
+		ipa := ipa4
+		if ip == nil {
+			ip = nc.Subnet.IP.To16()
+			mask = net.CIDRMask(num_ones, 128)
+			gw = nc.Gateway.To16()
+			ipa = ipa6
+			if ip == nil {
+				continue
+			}
+		}
+		last := make(net.IP, len(ip))
+		for i := 0; i < len(ip); i++ {
+			last[i] = ip[i] | ^mask[i]
+		}
+		// TODO add a random offset to start address
+		ipa.AddRange(ip, last)
+		// remove the start address and gateway address
+		ipa.RemoveIp(ip)
+		ipa.RemoveIp(gw)
 	}
-	
-	*nodes = append(*nodes, nd)
-	for _, n := range nd.Nodes {
-		env.processResponse(n, nodes)
+
+	netips := metadata.NetIps{V4: ipa4.FreeList, V6: ipa6.FreeList}
+	raw, err := json.Marshal(&netips)
+	if err != nil {
+		env.log.Error("Could not create default ip-pool", err)
+		return ""
 	}
+	env.log.Debug("Setting default IP pool to ", string(raw))
+	return string(raw)
 }
 
 func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 	kapi := etcdclient.NewKeysAPI(env.etcdClient)
 	cellKey := etcd.CELL_KEY_BASE + "/" + env.cellID
+	cellNetKey := cellKey + "/network"
 	ctBaseKey := cellKey + "/containers/"
 	w := kapi.Watcher(cellKey, &etcdclient.WatcherOptions{Recursive: true})
+	cellNetNodeExists := false
 
 	// Get info about the cell-specific subtree
 	resp, err := kapi.Get(context.Background(), cellKey, &etcdclient.GetOptions{Recursive: true})
@@ -53,11 +91,16 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 			return err
 		}
 	} else {
-		env.processResponse(resp.Node, &nodes)
+		etcd.FlattenNodes(resp.Node, &nodes)
 	}
 
 	handleEtcdNode := func (action *string, node *etcdclient.Node) error {
-		if strings.HasPrefix(node.Key, ctBaseKey) {
+		if node.Key == cellKey {
+			return env.handleEtcdCellNode(action, node)
+		} else if node.Key == cellNetKey {
+			cellNetNodeExists = true
+			return env.handleEtcdCellNetworkNode(action, node)
+		} else if strings.HasPrefix(node.Key, ctBaseKey) {
 			return env.handleEtcdContainerNode(action, node)
 		}
 		return nil
@@ -66,6 +109,11 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 	act := "set"
 	for _, nd := range nodes {
 		handleEtcdNode(&act, nd)
+	}
+	if !cellNetNodeExists {
+		env.log.Info("Cell network info node not found in etcd")
+		defIpPool := env.getDefaultIpPool()
+		env.agent.updateIpamAnnotation(defIpPool)
 	}
 	env.log.Debug(fmt.Sprintf("Handled %d initial etcd nodes", len(nodes)))
 
@@ -83,6 +131,22 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 	return nil
 }
 
+func (env *CfEnvironment) handleEtcdCellNode(action *string, node *etcdclient.Node) error {
+	if isDeleteAction(action) {
+		env.agent.updateIpamAnnotation("[]")
+	}
+	return nil
+}
+
+func (env *CfEnvironment) handleEtcdCellNetworkNode(action *string, node *etcdclient.Node) error {
+	if isDeleteAction(action) {
+		env.agent.updateIpamAnnotation("[]")
+	} else {
+		env.agent.updateIpamAnnotation(node.Value)
+	}
+	return nil
+}
+
 func (env *CfEnvironment) handleEtcdContainerNode(action *string, node *etcdclient.Node) error {
 	epNode := strings.HasSuffix(node.Key, "/ep")
 	key_parts := strings.Split(node.Key, "/")
@@ -90,7 +154,7 @@ func (env *CfEnvironment) handleEtcdContainerNode(action *string, node *etcdclie
 	if !epNode {
 		ctId = key_parts[len(key_parts) - 1]
 	}
-	deleted := (*action == "delete" || *action == "compareAndDelete" || *action == "expire")
+	deleted := isDeleteAction(action)
 	if epNode && !deleted {
 		var ep etcd.EpInfo
 		err := json.Unmarshal([]byte(node.Value), &ep)

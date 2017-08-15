@@ -16,6 +16,7 @@ package hostagent
 
 import (
 	"encoding/json"
+	"fmt"
 	"errors"
 	"io/ioutil"
 	"os"
@@ -204,17 +205,17 @@ func (env *CfEnvironment) CniDeviceDeleted(metadataKey *string, id *md.Container
 	env.cfAppDeleted(&id.Pod)
 }
 
-func (env *CfEnvironment) cfAppChanged(cfAppId *string, metaKey *string) {
+func (env *CfEnvironment) cfAppChanged(ctId *string, metaKey *string) {
 	// TODO Find a better way to identify containers that we want to hide
 	if strings.Contains(*metaKey, "executor-healthcheck-") {
 		return
 	}
 
 	env.indexLock.Lock()
-	ep, ok := env.epIdx[*cfAppId]
+	ep, ok := env.epIdx[*ctId]
 	env.indexLock.Unlock()
 	if !ok {
-		env.log.Debug("No EP info for container ", *cfAppId)
+		env.log.Debug("No EP info for container ", *ctId)
 		return
 	}
 
@@ -224,18 +225,27 @@ func (env *CfEnvironment) cfAppChanged(cfAppId *string, metaKey *string) {
 		secGroup[i].PolicySpace = s.Tenant
 		secGroup[i].Name = s.Group
 	}
-	/*secGroup := make([]md.OpflexGroup, 0)*/
 
 	epAttributes := make(map[string]string)
-	epAttributes["vm-name"] = *cfAppId
+	if ep.AppName != "" {
+		if ep.InstanceIndex < 0 {
+			epAttributes["vm-name"] = ep.AppName + " (staging)"
+		} else {
+			epAttributes["vm-name"] = fmt.Sprintf("%s (%d)", ep.AppName, ep.InstanceIndex)
+		}
+	} else {
+		epAttributes["vm-name"] = *ctId
+	}
+	epAttributes["app-id"] = ep.AppId
+	epAttributes["container-id"] = *ctId
 
 	env.agent.indexMutex.Lock()
 	defer env.agent.indexMutex.Unlock()
-	env.agent.epChanged(cfAppId, metaKey, epGroup, secGroup, epAttributes, nil)
+	env.agent.epChanged(ctId, metaKey, epGroup, secGroup, epAttributes, nil)
 }
 
-func (env *CfEnvironment) cfAppDeleted(cfAppId *string) {
+func (env *CfEnvironment) cfAppDeleted(ctId *string) {
 	env.agent.indexMutex.Lock()
 	defer env.agent.indexMutex.Unlock()
-	env.agent.epDeleted(cfAppId)
+	env.agent.epDeleted(ctId)
 }

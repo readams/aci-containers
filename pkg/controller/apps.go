@@ -20,39 +20,53 @@ import (
 	"hash/fnv"
 	"net"
 	"strings"
-	
+	"reflect"
+	"time"
+
 	"code.cloudfoundry.org/bbs/events"
 	"code.cloudfoundry.org/bbs/models"
-	
+
 	cfclient "github.com/cloudfoundry-community/go-cfclient"
-	"golang.org/x/net/context"
 	etcdclient "github.com/coreos/etcd/client"
+	"golang.org/x/net/context"
 
 	"github.com/noironetworks/aci-containers/pkg/apicapi"
+	"github.com/noironetworks/aci-containers/pkg/cfapi"
 	"github.com/noironetworks/aci-containers/pkg/etcd"
 	"github.com/noironetworks/aci-containers/pkg/ipam"
 )
 
 type AppAndSpace struct {
-	AppId       string          `json:"application_id",omitempty"`
-	SpaceId     string          `json:"space_id",omitempty"`
+	AppId           string          `json:"application_id",omitempty"`
+	SpaceId         string          `json:"space_id",omitempty"`
+	AppName         string          `json:"application_name",omitempty"`
 }
 
 type AppUpdateInfo struct {
-	AppId       string          `json:"application_id",omitempty"`
-	SpaceId     string          `json:"space_id",omitempty"`
-	OrgId       string
-	ContainerId string
-	CellId      string
-	Staging     bool
-	Deleted     bool
+	AppId           string
+	AppName         string
+	SpaceId         string
+	OrgId           string
+	ContainerId     string
+	InstanceIndex   int32
+	IpAddress       string
+	CellId          string
+	Staging         bool
+	Deleted         bool
 }
 
-func (env *CfEnvironment) initBbsEventListener(appCh chan<- AppUpdateInfo, stopCh <-chan struct{}) {
+type ActualLRPInfo struct {
+    InstanceGuid string
+    CellId       string
+    IpAddress    string
+    Index        int32
+}
+
+func (env *CfEnvironment) initBbsEventListener(appCh chan<- interface{}, stopCh <-chan struct{}) {
 	env.initBbsAppListener(false, appCh, stopCh)
 }
 
-func (env *CfEnvironment) initBbsTaskListener(appCh chan<- AppUpdateInfo, stopCh <-chan struct{}) {
+func (env *CfEnvironment) initBbsTaskListener(appCh chan<- interface{}, stopCh <-chan struct{}) {
 	env.initBbsAppListener(true, appCh, stopCh)
 }
 
@@ -86,15 +100,15 @@ func findRunAction(act *models.Action) *models.RunAction {
 	return nil
 }
 
-func (env *CfEnvironment) getAppAndSpaceFromLrp(dlrp *models.DesiredLRP) (string, string) {
+func (env *CfEnvironment) getAppAndSpaceFromLrp(dlrp *models.DesiredLRP) *AppAndSpace {
 	return env.getAppAndSpaceFromAction(dlrp.GetAction())
 }
 
-func (env *CfEnvironment) getAppAndSpaceFromTask(task *models.Task) (string, string) {
+func (env *CfEnvironment) getAppAndSpaceFromTask(task *models.Task) *AppAndSpace {
 	return env.getAppAndSpaceFromAction(task.GetAction())
 }
 
-func (env *CfEnvironment) getAppAndSpaceFromAction(action *models.Action) (string, string) {
+func (env *CfEnvironment) getAppAndSpaceFromAction(action *models.Action) *AppAndSpace {
 	act := findRunAction(action)
 	if act != nil {
 		for _, envVar := range act.Env {
@@ -103,20 +117,20 @@ func (env *CfEnvironment) getAppAndSpaceFromAction(action *models.Action) (strin
 				err := json.Unmarshal([]byte(envVar.Value), &as)
 				if err != nil {
 					env.log.Error("JSON deserialize failed for VCAP_APPLICATION env var: ", err)
-					return "", ""
+					return nil
 				} else {
-					return as.AppId, as.SpaceId
+					return &as
 				}
 			}
 		}
 	}
-	return "", ""
+	return nil
 }
 
 func (env *CfEnvironment) fetchLrps(dlrpInfo map[string]AppAndSpace,
 								   alrpInfo map[string]AppAndSpace,
-								   pendingDlrp map[string][]models.ActualLRPInstanceKey,
-								   appCh chan<- AppUpdateInfo) error {
+								   pendingDlrp map[string][]ActualLRPInfo,
+								   appCh chan<- interface{}) error {
 	// Get all desired LRPs
 	existDesired, err := env.bbsClient.DesiredLRPs(env.cfLogger, models.DesiredLRPFilter{})
 	if err != nil {
@@ -124,9 +138,9 @@ func (env *CfEnvironment) fetchLrps(dlrpInfo map[string]AppAndSpace,
 		return err
 	}
 	for _, dlrp := range existDesired {
-		appId, spaceId := env.getAppAndSpaceFromLrp(dlrp)
-		if appId != "" && spaceId != "" {
-			dlrpInfo[dlrp.GetProcessGuid()] = AppAndSpace{appId, spaceId}
+		as := env.getAppAndSpaceFromLrp(dlrp)
+		if as != nil {
+			dlrpInfo[dlrp.GetProcessGuid()] = *as
 		}
 	}
 	if err != nil {
@@ -148,18 +162,21 @@ func (env *CfEnvironment) fetchLrps(dlrpInfo map[string]AppAndSpace,
 func (env *CfEnvironment) processActualLrp(alrpg *models.ActualLRPGroup,
 										  dlrpInfo map[string]AppAndSpace,
 										  alrpInfo map[string]AppAndSpace,
-										  pendingDlrp map[string][]models.ActualLRPInstanceKey,
+										  pendingDlrp map[string][]ActualLRPInfo,
 										  deleted bool) *AppUpdateInfo {
 	var upd *AppUpdateInfo
 	if alrpg.Instance != nil {
 		pguid := alrpg.Instance.ProcessGuid
 		contId := alrpg.Instance.InstanceGuid
 		cellId := alrpg.Instance.CellId
+		addr := alrpg.Instance.InstanceAddress
+		index := alrpg.Instance.Index
 
 		as, ok := dlrpInfo[pguid]
 		if ok {
 			upd = &AppUpdateInfo{AppId: as.AppId, SpaceId: as.SpaceId, Staging: false,
-								CellId: cellId, ContainerId: contId,
+								CellId: cellId, ContainerId: contId, IpAddress: addr,
+								AppName: as.AppName, InstanceIndex: index,
 								Deleted: deleted}
 			if !deleted {
 				alrpInfo[contId] = as
@@ -167,7 +184,7 @@ func (env *CfEnvironment) processActualLrp(alrpg *models.ActualLRPGroup,
 		} else if !deleted {
 			env.log.Debug("Pending LRP ProcessGuid " + pguid + ", containerId " + contId)
 			pendingDlrp[pguid] = append(pendingDlrp[pguid],
-									    models.ActualLRPInstanceKey{contId, cellId})
+									    ActualLRPInfo{contId, cellId, addr, index})
 		}
 
 		if deleted {
@@ -201,17 +218,18 @@ func (env *CfEnvironment) processActualLrp(alrpg *models.ActualLRPGroup,
 	return upd
 }
 
-func (env *CfEnvironment) fetchTasks(appCh chan<- AppUpdateInfo) error {
+func (env *CfEnvironment) fetchTasks(appCh chan<- interface{}) error {
 	tasks, err := env.bbsClient.Tasks(env.cfLogger)
 	if err != nil {
 		env.log.Error("Initial fetch of all tasks failed: ", err)
 		return err
 	}
 	for _, task := range tasks {
-		appId, spaceId := env.getAppAndSpaceFromTask(task)
-		if appId != "" && spaceId != "" {
-			upd := AppUpdateInfo{AppId: appId, SpaceId: spaceId, Staging: true,
+		as := env.getAppAndSpaceFromTask(task)
+		if as != nil {
+			upd := AppUpdateInfo{AppId: as.AppId, SpaceId: as.SpaceId, Staging: true,
 								ContainerId: task.TaskGuid, CellId: task.CellId,
+								AppName: as.AppName, InstanceIndex: -1,
 								Deleted: false}
 			appCh <- upd
 		}
@@ -219,7 +237,7 @@ func (env *CfEnvironment) fetchTasks(appCh chan<- AppUpdateInfo) error {
 	return nil
 }
 
-func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- AppUpdateInfo, stopCh <-chan struct{}) {
+func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- interface{}, stopCh <-chan struct{}) {
 	ev_type := "event"
 	if isTask {
 		ev_type = "task"
@@ -239,13 +257,16 @@ func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- AppUpdate
 	
 	dlrpInfo := make(map[string]AppAndSpace)
 	alrpInfo := make(map[string]AppAndSpace)
-	pendingDlrp := make(map[string][]models.ActualLRPInstanceKey)
+	pendingDlrp := make(map[string][]ActualLRPInfo)
 
 	// Now that we have subscribed, fetch the current list of LRPs/tasks
 	if isTask {
 		err = env.fetchTasks(appCh)
 	} else {
 		err = env.fetchLrps(dlrpInfo, alrpInfo, pendingDlrp, appCh)
+		if err == nil {
+			appCh <- "bbs-ready"
+		}
 	}
 	if err != nil {
 		return
@@ -297,19 +318,20 @@ func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- AppUpdate
 			default:
 				continue
 			}
-			var appId, spaceId string
 			var appUpdates []AppUpdateInfo
 			if dlrp != nil {
-				appId, spaceId = env.getAppAndSpaceFromLrp(dlrp)
+				as := env.getAppAndSpaceFromLrp(dlrp)
 				if deleted {
 					delete(dlrpInfo, dlrp.GetProcessGuid())
 					delete(pendingDlrp, dlrp.GetProcessGuid())
-				} else {
-					dlrpInfo[dlrp.GetProcessGuid()] = AppAndSpace{appId, spaceId}
+				} else if as != nil {
+					dlrpInfo[dlrp.GetProcessGuid()] = *as
 					for _, actual := range pendingDlrp[dlrp.GetProcessGuid()] {
-						upd := AppUpdateInfo{AppId: appId, SpaceId: spaceId, Staging: false,
+						upd := AppUpdateInfo{AppId: as.AppId, SpaceId: as.SpaceId, Staging: false,
 											 ContainerId: actual.InstanceGuid, CellId: actual.CellId,
-											 Deleted: false}
+											 IpAddress: actual.IpAddress, Deleted: false,
+											 InstanceIndex: actual.Index,
+											 AppName: as.AppName}
 						appUpdates = append(appUpdates, upd)
 					}
 					delete(pendingDlrp, dlrp.GetProcessGuid())
@@ -320,10 +342,11 @@ func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- AppUpdate
 					appUpdates = append(appUpdates, *upd)
 				}
 			} else if task != nil {
-				appId, spaceId = env.getAppAndSpaceFromTask(task)
-				if appId != "" && spaceId != "" {
-					upd := AppUpdateInfo{AppId: appId, SpaceId: spaceId, Staging: true,
+				as := env.getAppAndSpaceFromTask(task)
+				if as != nil {
+					upd := AppUpdateInfo{AppId: as.AppId, SpaceId: as.SpaceId, Staging: true,
 										 ContainerId: task.TaskGuid, CellId: task.CellId,
+										 AppName: as.AppName, InstanceIndex: -1,
 										 Deleted: deleted}
 					appUpdates = append(appUpdates, upd)
 				}
@@ -339,6 +362,8 @@ func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- AppUpdate
 type ContainerInfo struct {
 	ContainerId     string
 	CellId          string
+	InstanceIndex   int32
+	IpAddress       string
 	AppId           string
 	Staging         bool
 }
@@ -346,7 +371,9 @@ type ContainerInfo struct {
 type AppInfo struct {
 	AppId             string
 	SpaceId           string
+	AppName           string
 	NetworkPolicies   []string
+	ContainerIps      map[string]string
 }
 
 type SpaceInfo struct {
@@ -359,24 +386,53 @@ type SpaceInfo struct {
 
 type SecurityGroupInfo struct {
 	cfclient.SecGroup
-	RulesHash      string
+	RulesHash      uint64
 }
 
-func hashJsonSerializable(obj interface{}) (string, error) {
+func hashJsonSerializable(obj interface{}) (uint64, error) {
 	js, err := json.Marshal(obj)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	hasher := fnv.New64()
 	hasher.Reset()
 	_, err = hasher.Write(js)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
-	return string(hasher.Sum64()), nil
+	return hasher.Sum64(), nil
 }
 
-func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan AppUpdateInfo, stopCh <-chan struct{}) {
+func (env *CfEnvironment) fetchSpaceInfo(spaceId *string) (*SpaceInfo, []cfclient.SecGroup, error) {
+	sp, err := env.ccClient.GetSpaceByGuid(*spaceId)
+	if err != nil {
+		env.log.Error("Error fetching info for space " + *spaceId + ": ", err)
+		return nil, nil, err
+	}
+	runsg, err := env.ccClient.ListSecGroupsBySpace(*spaceId, false)
+	if err != nil {
+		env.log.Error("Error fetching running ASGs for space " + *spaceId + ": ", err)
+		return nil, nil, err
+	}
+	stagesg, err := env.ccClient.ListSecGroupsBySpace(*spaceId, true)
+	if err != nil {
+		env.log.Error("Error fetching staging ASGs for space " + *spaceId + ": ", err)
+		return nil, nil, err
+	}
+	spi := SpaceInfo{SpaceId: sp.Guid, OrgId: sp.OrganizationGuid}
+	for _, sg := range runsg {
+		spi.RunningSecurityGroups = append(spi.RunningSecurityGroups, sg.Guid)
+	}
+	for _, sg := range stagesg {
+		spi.StagingSecurityGroups = append(spi.StagingSecurityGroups, sg.Guid)
+	}
+	var allsgs []cfclient.SecGroup
+	allsgs = append(allsgs, runsg...)
+	allsgs = append(allsgs, stagesg...)
+	return &spi, allsgs, nil
+}
+
+func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <-chan struct{}) {
 	updateAsg := func (sg *cfclient.SecGroup) bool {
 		oldsg, ok := env.asgIdx[sg.Guid]
 		// exclude these fields in hash calc
@@ -399,30 +455,97 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan AppUpdateInfo, stopCh
 		select {
 		case <-stopCh:
 			return
-		case upd := <-appCh:
-			// env.log.Debug("Received app update: ", upd)
-			if upd.ContainerId == "" {
+
+		case recvd:= <- appCh:
+			str, ok := recvd.(string)
+			if ok {
+				if str == "bbs-ready" {
+					// we have received all app-updates for existing apps. Cleanup stale etcd entries
+					env.log.Debug("Cleaning up stale etcd entries")
+					err := env.cleanupEtcdContainers()
+					if err != nil {
+						env.log.Warning("Error cleaning up stale etcd container nodes: ", err)
+					}
+					env.idxStatusChan <- "index-ready"
+				}
 				continue
 			}
-			
+			upd, ok := recvd.(AppUpdateInfo)
+			if !ok || upd.ContainerId == "" {
+				continue
+			}
+			// env.log.Debug("Received app update: ", upd)
+
 			var contChanged []string
 			var contDeleted []*ContainerInfo
+			var appChanged []string
 			var asgChanged []string
-			
-			env.indexLock.Lock()
-			// TODO avoid holding lock while doing RPCs
-			c, ok := env.contIdx[upd.ContainerId]
+
 			if upd.Deleted {
+				env.indexLock.Lock()
+				c, ok := env.contIdx[upd.ContainerId]
 				delete(env.contIdx, upd.ContainerId)
 				if !ok {
 					c.ContainerId = upd.ContainerId
 				}
 				contDeleted = append(contDeleted, &c)
+				if c.AppId != "" {
+					if app, ok := env.appIdx[c.AppId]; ok {
+						delete(app.ContainerIps, c.ContainerId)
+						env.appIdx[c.AppId] = app
+						appChanged = append(appChanged, upd.AppId)
+					}
+				}
 			} else {
+				var spi *SpaceInfo
+				var allsgs []cfclient.SecGroup
+				var err error
+				if upd.SpaceId != "" {
+					spi, allsgs, err = env.fetchSpaceInfo(&upd.SpaceId)
+					if err != nil {
+						// TODO need to retry
+					}
+					// env.log.Debug(fmt.Sprintf("Space info: %+v", *spi))
+				}
+
+				// update the indexes
+				env.indexLock.Lock()
+
+				// process spaces and ASGs
+				for idx, _ := range allsgs {
+					if updateAsg(&allsgs[idx]) {
+						asgChanged = append(asgChanged, allsgs[idx].Guid)
+					}
+				}
+				if spi != nil {
+					env.spaceIdx[upd.SpaceId] = *spi
+				}
+
+				// process Apps
+				if upd.AppId != "" && upd.SpaceId != "" {
+					app, ok := env.appIdx[upd.AppId]
+					if !ok {
+						app = AppInfo{AppId: upd.AppId, SpaceId: upd.SpaceId,
+									  AppName: upd.AppName,
+									  ContainerIps: make(map[string]string)}
+					} else {
+						app.SpaceId = upd.SpaceId
+						if upd.AppName != "" {
+							app.AppName = upd.AppName
+						}
+					}
+					app.ContainerIps[upd.ContainerId] = upd.IpAddress
+					env.appIdx[upd.AppId] = app
+					appChanged = append(appChanged, upd.AppId)
+				}
+
+				c, ok := env.contIdx[upd.ContainerId]
 				if !ok {
 					env.contIdx[upd.ContainerId] = ContainerInfo{ContainerId: upd.ContainerId,
 																AppId: upd.AppId,
 																CellId: upd.CellId,
+																IpAddress: upd.IpAddress,
+																InstanceIndex: upd.InstanceIndex,
 																Staging: upd.Staging}
 				} else {
 					if upd.AppId != "" {
@@ -431,46 +554,14 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan AppUpdateInfo, stopCh
 					if upd.CellId != "" {
 						c.CellId = upd.CellId
 					}
+					if upd.IpAddress != "" {
+						c.IpAddress = upd.IpAddress
+					}
+					c.InstanceIndex = upd.InstanceIndex
 					env.contIdx[upd.ContainerId] = c
 				}
 				contChanged = append(contChanged, upd.ContainerId)
-				
-				if upd.AppId != "" && upd.SpaceId != "" {
-					env.appIdx[upd.AppId] = AppInfo{AppId: upd.AppId, SpaceId: upd.SpaceId}
-				}
-				if upd.SpaceId != "" {
-					sp, err := env.ccClient.GetSpaceByGuid(upd.SpaceId)
-					if err != nil {
-						env.log.Error("Error fetching info for space " + upd.SpaceId + ": ", err)
-						// how do we retry?
-					}
-					runsg, err := env.ccClient.ListSecGroupsBySpace(upd.SpaceId, false)
-					if err != nil {
-						env.log.Error("Error fetching running ASGs for space " + upd.SpaceId + ": ", err)
-						// how do we retry?
-					}
-					stagesg, err := env.ccClient.ListSecGroupsBySpace(upd.SpaceId, true)
-					if err != nil {
-						env.log.Error("Error fetching staging ASGs for space " + upd.SpaceId + ": ", err)
-						// how do we retry?
-					}
-					spi := SpaceInfo{SpaceId: sp.Guid, OrgId: sp.OrganizationGuid}
-					for _, sg := range runsg {
-						spi.RunningSecurityGroups = append(spi.RunningSecurityGroups, sg.Guid)
-						if updateAsg(&sg) {
-							asgChanged = append(asgChanged, sg.Guid)
-						}
-					}
-					for _, sg := range stagesg {
-						spi.StagingSecurityGroups = append(spi.StagingSecurityGroups, sg.Guid)
-						if updateAsg(&sg) {
-							asgChanged = append(asgChanged, sg.Guid)
-						}
-					}
-					env.spaceIdx[upd.SpaceId] = spi
-				}
 			}
-			env.indexLock.Unlock()
 
 			for _, c := range contChanged {
 				env.notifyContainerUpdate(c)
@@ -478,12 +569,53 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan AppUpdateInfo, stopCh
 			for _, c := range contDeleted {
 				env.notifyContainerDelete(c)
 			}
+			for _, a := range appChanged {
+				env.notifyAppUpdate(a)
+			}
 			for _, g := range asgChanged {
 				env.notifyAsgUpdate(g)
 			}
+			env.indexLock.Unlock()
 		}
 	}
 	return
+}
+
+func (env *CfEnvironment) cleanupEtcdContainers() error {
+	kapi := etcdclient.NewKeysAPI(env.etcdClient)
+	cellKey := etcd.CELL_KEY_BASE
+	resp, err := kapi.Get(context.Background(), cellKey, &etcdclient.GetOptions{Recursive: true})
+	if err != nil {
+		env.log.Error("Unable to fetch etcd container nodes: ", err)
+		return err
+	}
+	var nodes etcdclient.Nodes
+	etcd.FlattenNodes(resp.Node, &nodes)
+
+	env.indexLock.Lock()
+	defer env.indexLock.Unlock()
+
+	for _, n := range nodes {
+		key_parts := strings.Split(n.Key, "/")
+		// process keys of the form /aci/cells/<cell-id>/containers/<container-id>
+		if len(key_parts) != 6 {
+			continue
+		}
+		if key_parts[4] != "containers" {
+			continue
+		}
+		cell_id := key_parts[3]
+		cont_id := key_parts[5]
+		c, ok := env.contIdx[cont_id]
+		if !ok || c.CellId != cell_id {
+			env.log.Info(fmt.Sprintf("Deleting stale container %s on cell %s", cont_id, cell_id))
+			_, err := kapi.Delete(context.Background(), n.Key, &etcdclient.DeleteOptions{Recursive: true})
+			if err != nil {
+				env.log.Error("Error deleting container node: ", err)
+			}
+		}
+	}
+	return nil
 }
 
 func (env *CfEnvironment) notifyContainerUpdate(contId string) {
@@ -503,33 +635,40 @@ func (env *CfEnvironment) notifyContainerUpdate(contId string) {
 			}
 		}
 	}
-	env.log.Debug(
-		fmt.Sprintf("Container update: %s, cell %s, app %s", contId, cinfo.CellId, cinfo.AppId))
+	env.log.Debug(fmt.Sprintf("Container update: %+v", cinfo))
 	if cinfo.CellId != "" {
-		cellKey := etcd.CELL_KEY_BASE + "/" + cinfo.CellId
-		netinfo := "[{\"start\": \"10.255.0.2\", \"end\": \"10.255.0.129\"}]"
-		kapi := etcdclient.NewKeysAPI(env.etcdClient)
-		_, err := kapi.Set(context.Background(), cellKey + "/network", netinfo, nil)
-		if err != nil {
-			env.log.Error("Error setting etcd net info for cell: ", err)
-		}
+
+		env.cont.indexMutex.Lock()
+		env.cont.addPodToNode(cinfo.CellId, contId)
+		env.cont.indexMutex.Unlock()
 
 		ctKey := etcd.CELL_KEY_BASE + "/" + cinfo.CellId + "/containers/" + cinfo.ContainerId
 		ep := etcd.EpInfo{AppId: cinfo.AppId,
+						  AppName: appInfo.AppName,
+						  InstanceIndex: cinfo.InstanceIndex,
 						  EpgTenant: env.cont.config.DefaultEg.PolicySpace,
 						  Epg: env.cont.config.DefaultEg.Name}
 		ep.SecurityGroups = append(ep.SecurityGroups,
-								  etcd.GroupInfo{Group: env.cont.aciNameForKey("asg", "static"),
+								  etcd.GroupInfo{Group: env.cont.aciNameForKey("hpp", "static"),
 												 Tenant: env.cont.config.AciPolicyTenant})
-		for _, s := range *sg {
+		if sg != nil {
+			for _, s := range *sg {
+				ep.SecurityGroups = append(ep.SecurityGroups,
+										  etcd.GroupInfo{Group: env.cont.aciNameForKey("asg", s),
+														 Tenant: env.cont.config.AciPolicyTenant})
+			}
+		}
+		_, ok := env.netpolIdx[cinfo.AppId]
+		if ok {
 			ep.SecurityGroups = append(ep.SecurityGroups,
-									  etcd.GroupInfo{Group: env.cont.aciNameForKey("asg", s),
-												  	 Tenant: env.cont.config.AciPolicyTenant})
+									  etcd.GroupInfo{Group: env.cont.aciNameForKey("np", cinfo.AppId),
+													 Tenant: env.cont.config.AciPolicyTenant})
 		}
 		ep_json, err := json.Marshal(ep)
 		if err != nil {
 			env.log.Error("Unable to serialize EP info: ", err)
 		} else {
+			kapi := etcdclient.NewKeysAPI(env.etcdClient)
 			_, err = kapi.Set(context.Background(), ctKey + "/ep", string(ep_json), nil)
 			if err != nil {
 				env.log.Error("Error setting container info: ", err)
@@ -539,14 +678,38 @@ func (env *CfEnvironment) notifyContainerUpdate(contId string) {
 }
 
 func (env *CfEnvironment) notifyContainerDelete(cinfo *ContainerInfo) {
-	env.log.Debug(fmt.Sprintf("Container delete: %s, cell %s", cinfo.ContainerId, cinfo.CellId))
+	env.log.Debug(fmt.Sprintf("Container delete: %+v", *cinfo))
 	if cinfo.CellId != "" {
+		env.cont.indexMutex.Lock()
+		env.cont.removePodFromNode(cinfo.CellId, cinfo.ContainerId)
+		env.cont.indexMutex.Unlock()
+
 		kapi := etcdclient.NewKeysAPI(env.etcdClient)
 		ctKey := etcd.CELL_KEY_BASE + "/" + cinfo.CellId + "/containers/" + cinfo.ContainerId
 		_, err := kapi.Delete(context.Background(), ctKey, &etcdclient.DeleteOptions{Recursive: true})
 		if err != nil {
 			env.log.Error("Error deleting container node: ", err)
 		}
+	}
+}
+
+func (env *CfEnvironment) notifyAppUpdate(appId string) {
+	ainfo, ok := env.appIdx[appId]
+	if !ok {
+		return
+	}
+	env.log.Debug(fmt.Sprintf("App update : %+v", ainfo))
+	// find destination PolIds for which this App is a source
+	var dstPolIds []string
+	for k, info := range env.netpolIdx {
+		if _, ok := info[appId]; ok {
+			dstPolIds = append(dstPolIds, k)
+		}
+	}
+	env.log.Debug("Dst policy Ids to update: ", dstPolIds)
+	for _, d := range dstPolIds {
+		hpp := env.createHppForNetPol(&d)
+		env.cont.apicConn.WriteApicObjects("np:" + d, hpp)
 	}
 }
 
@@ -641,4 +804,119 @@ func (env *CfEnvironment) notifyAsgUpdate(asgId string) {
 	hpp.AddChild(egressSubj)
 
 	cont.apicConn.WriteApicObjects("asg:" + asgId, apicapi.ApicSlice{hpp})
+}
+
+func (env *CfEnvironment) initNetworkPolicyPoller(stopCh <-chan struct{}) {
+	cont := env.cont
+	var errDelayTime time.Duration = 10
+	timer := time.NewTimer(1 * time.Second)
+	oldRespHash := uint64(0)
+
+	for {
+		select {
+		case <-stopCh:
+			return
+
+		case <-timer.C:
+			allNetPol, err := env.netpolClient.GetPolicies()
+			if err != nil {
+				env.log.Error("Error fetching network policies: ", err)
+				timer.Reset(errDelayTime * time.Second)
+				continue
+			}
+			newRespHash, err := hashJsonSerializable(allNetPol)
+			if err != nil {
+				env.log.Warning("Failed to hash network policies response: " , err)
+			} else if oldRespHash == newRespHash {
+				timer.Reset(time.Duration(env.cfconfig.NetPolPollingInterval) *
+							time.Second)
+				continue
+			}
+			env.log.Debug(fmt.Sprintf("Fetched %d network-policies, oldHash %x newHash %x",
+						  len(allNetPol), oldRespHash, newRespHash))
+			// Diff against current net-policies
+			npRead := make(map[string]map[string][]cfapi.Destination)
+			for _, npol := range allNetPol {
+				dst := npol.Destination.ID
+				npol.Destination.ID = npol.Source.ID
+
+				npDst, ok := npRead[dst]
+				if !ok {
+					npDst = make(map[string][]cfapi.Destination)
+				}
+				npDst[npol.Source.ID] = append(npDst[npol.Source.ID], npol.Destination)
+				npRead[dst] = npDst
+			}
+			var updates []string
+			var ep_updates []string
+			to_delete := make(map[string]bool)
+			env.indexLock.Lock()
+			for k := range env.netpolIdx {
+				to_delete[k] = true
+			}
+			// Update known net-policies
+			for k, v := range npRead {
+				oldnp, ok := env.netpolIdx[k]
+				if !ok || !reflect.DeepEqual(oldnp, v) {
+					env.netpolIdx[k] = v
+					env.log.Debug(fmt.Sprintf("Add/update net pol %s: %+v", k, v))
+					updates = append(updates, k)
+					if !ok {
+						ep_updates = append(ep_updates, k)
+					}
+				}
+				to_delete[k] = false
+			}
+			// Process updated net-policies
+			for _, polId := range updates {
+				hpp := env.createHppForNetPol(&polId)
+				cont.apicConn.WriteApicObjects("np:" + polId, hpp)
+			}
+			for k, v := range to_delete {
+				if v {
+					delete(env.netpolIdx, k)
+					env.log.Debug("Delete net pol ", k)
+					cont.apicConn.ClearApicObjects("np:" + k)
+					ep_updates = append(ep_updates, k)
+				}
+			}
+			for _, a := range ep_updates {
+				for k := range env.appIdx[a].ContainerIps {
+					env.notifyContainerUpdate(k)
+				}
+			}
+			env.indexLock.Unlock()
+			oldRespHash = newRespHash
+			env.idxStatusChan <- "net-policy-ready"
+			timer.Reset(time.Duration(env.cfconfig.NetPolPollingInterval) *
+						time.Second)
+		}
+	}
+}
+
+func (env *CfEnvironment) createHppForNetPol(polId *string) apicapi.ApicSlice {
+	// must be called with index lock
+
+	npApicName := env.cont.aciNameForKey("np", *polId)
+	hpp := apicapi.NewHostprotPol(env.cont.config.AciPolicyTenant, npApicName)
+	for srcId, info := range env.netpolIdx[*polId] {
+		ingressSubj := apicapi.NewHostprotSubj(hpp.GetDn(), "in-" + srcId)
+		subjDn := ingressSubj.GetDn()
+		for i, rule := range info {
+			hpr := apicapi.NewHostprotRule(subjDn, fmt.Sprintf("rule_%d", i))
+			hpr.SetAttr("direction", "ingress")
+			hpr.SetAttr("ethertype", "ipv4")              // TODO fix for v6
+			hpr.SetAttr("protocol", rule.Protocol)
+			hpr.SetAttr("fromPort", fmt.Sprintf("%d", rule.Ports.Start))
+			hpr.SetAttr("toPort", fmt.Sprintf("%d", rule.Ports.End))
+
+			for _, ip := range env.appIdx[srcId].ContainerIps {
+				hpremote := apicapi.NewHostprotRemoteIp(hpr.GetDn(), ip)
+				hpr.AddChild(hpremote)
+			}
+			ingressSubj.AddChild(hpr)
+		}
+		hpp.AddChild(ingressSubj)
+	}
+	return apicapi.ApicSlice{hpp}
 }

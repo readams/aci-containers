@@ -117,6 +117,9 @@ type ControllerConfig struct {
 	// The number of IP addresses to allocate when a pod starts to run low
 	PodIpPoolChunkSize int `json:"pod-ip-pool-chunk-size,omitempty"`
 
+	// Pod subnet CIDR in the form <gateway-address>/<prefix-length>
+	PodSubnet string `json:"pod-subnet,omitempty"`
+
 	// IP addresses used for externally exposed load balanced services
 	ServiceIpPool []ipam.IpRange `json:"service-ip-pool,omitempty"`
 
