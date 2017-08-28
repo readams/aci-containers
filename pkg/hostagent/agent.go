@@ -50,6 +50,8 @@ type HostAgent struct {
 	syncEnabled         bool
 	opflexConfigWritten bool
 
+	ignoreOvsPorts      map[string][]string
+
 	netNsFuncChan chan func()
 }
 
@@ -64,6 +66,8 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 
 		podIpsV4: []*ipam.IpAlloc{ipam.New(), ipam.New()},
 		podIpsV6: []*ipam.IpAlloc{ipam.New(), ipam.New()},
+
+		ignoreOvsPorts: make(map[string][]string),
 
 		netNsFuncChan: make(chan func()),
 	}

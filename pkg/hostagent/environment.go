@@ -19,12 +19,17 @@ import (
 	"fmt"
 	"errors"
 	"io/ioutil"
+	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 
 	etcdclient "github.com/coreos/etcd/client"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/Sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
@@ -133,24 +138,40 @@ func (env *K8sEnvironment) CniDeviceChanged(metadataKey *string, id *md.Containe
 func (env *K8sEnvironment) CniDeviceDeleted(metadataKey *string, id *md.ContainerId) {
 }
 
+const (
+	NAT_PRE_CHAIN = "aci-nat-pre"
+	NAT_POST_CHAIN = "aci-nat-post"
+)
+
 type CfEnvironment struct {
 	cellID       string
 	agent        *HostAgent
+	cfconfig     *CfConfig
 	etcdClient   etcdclient.Client
 
 	indexLock    sync.Locker
 	epIdx        map[string]etcd.EpInfo
 
+	iptbl        *iptables.IPTables
+	ctPortMap    map[string]map[uint32]uint32
+	cfNetv4      bool
+	cfNetLink    netlink.Link
+
 	log          *logrus.Logger
+
 }
 
 type CfConfig struct {
 	CellID                             string                `json:"cell_id,omitempty"`
+	CellAddress                        string                `json:"cell_address,omitempty"`
 
 	EtcdUrl                            string                `json:"etcd_url,omitempty"`
 	EtcdCACertFile                     string                `json:"etcd_ca_cert_file"`
 	EtcdClientCertFile                 string                `json:"etcd_client_cert_file"`
 	EtcdClientKeyFile                  string                `json:"etcd_client_key_file"`
+
+	CfNetOvsPort                       string                `json:"cf_net_ovs_port"`
+	CfNetIntfAddress                   string                `json:"cf_net_interface_address"`
 }
 
 func NewCfEnvironment(config *HostAgentConfig, log *logrus.Logger) (*CfEnvironment, error) {
@@ -184,40 +205,67 @@ func NewCfEnvironment(config *HostAgentConfig, log *logrus.Logger) (*CfEnvironme
 	}
 
 	return &CfEnvironment{cellID: cfconfig.CellID, etcdClient: etcdClient, log: log,
-						  indexLock: &sync.Mutex{}}, nil
+						  cfconfig: cfconfig, indexLock: &sync.Mutex{}}, nil
 }
 
 func (env *CfEnvironment) Init(agent *HostAgent) error {
 	env.agent = agent
 	env.epIdx = make(map[string]etcd.EpInfo)
-	return nil
+	env.ctPortMap = make(map[string]map[uint32]uint32)
+	if env.cfconfig.CfNetOvsPort != "" {
+		env.agent.ignoreOvsPorts[env.agent.config.IntBridgeName] = []string{env.cfconfig.CfNetOvsPort}
+	}
+	cellIp := net.ParseIP(env.cfconfig.CellAddress)
+	if cellIp == nil {
+		err := fmt.Errorf("Invalid cell IP address")
+		return err
+	}
+	env.cfNetv4 = cellIp.To4() != nil
+	var err error
+	if env.cfNetv4 {
+		env.iptbl, err = iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	} else {
+		env.iptbl, err = iptables.NewWithProtocol(iptables.ProtocolIPv6)
+	}
+	return err
 }
 
 func (env *CfEnvironment) PrepareRun(stopCh <-chan struct{}) error {
+	err := env.setupLegacyCfNet()
+	if err != nil {
+		env.log.Error("Error setting up legacy CF networking: ", err)
+		return err
+	}
 	return env.initEtcdListener(stopCh)
 }
 
 func (env *CfEnvironment) CniDeviceChanged(metadataKey *string, id *md.ContainerId) {
-	env.cfAppChanged(&id.Pod, metadataKey)
+	// TODO Find a better way to identify containers that we want to hide
+	if strings.Contains(*metadataKey, "executor-healthcheck-") {
+		return
+	}
+
+	ctId := id.Pod
+	env.indexLock.Lock()
+	ep, ok := env.epIdx[ctId]
+	env.indexLock.Unlock()
+
+	if !ok {
+		env.log.Debug("No EP info for container ", ctId)
+		return
+	}
+	env.cfAppChanged(&ctId, &ep)
 }
 
 func (env *CfEnvironment) CniDeviceDeleted(metadataKey *string, id *md.ContainerId) {
-	env.cfAppDeleted(&id.Pod)
+	env.cfAppDeleted(&id.Pod, nil)
 }
 
-func (env *CfEnvironment) cfAppChanged(ctId *string, metaKey *string) {
-	// TODO Find a better way to identify containers that we want to hide
-	if strings.Contains(*metaKey, "executor-healthcheck-") {
+func (env *CfEnvironment) cfAppChanged(ctId *string, ep *etcd.EpInfo) {
+	if ep == nil {
 		return
 	}
-
-	env.indexLock.Lock()
-	ep, ok := env.epIdx[*ctId]
-	env.indexLock.Unlock()
-	if !ok {
-		env.log.Debug("No EP info for container ", *ctId)
-		return
-	}
+	metaKey := "_cf_/" + *ctId
 
 	epGroup := &md.OpflexGroup{ep.EpgTenant, ep.Epg}
 	secGroup := make([]md.OpflexGroup, len(ep.SecurityGroups))
@@ -240,12 +288,153 @@ func (env *CfEnvironment) cfAppChanged(ctId *string, metaKey *string) {
 	epAttributes["container-id"] = *ctId
 
 	env.agent.indexMutex.Lock()
-	defer env.agent.indexMutex.Unlock()
-	env.agent.epChanged(ctId, metaKey, epGroup, secGroup, epAttributes, nil)
+	env.agent.epChanged(ctId, &metaKey, epGroup, secGroup, epAttributes, nil)
+	env.updateLegacyCfNetService(ep.PortMapping)
+	env.agent.indexMutex.Unlock()
+
+	// Update iptables rules
+	// pre-routing DNAT rules
+	env.updatePreNatRule(ctId, ep, ep.PortMapping)
+	// post-routing SNAT rules
+	for _, pmap := range ep.PortMapping {
+		cport := fmt.Sprintf("%d", pmap.ContainerPort)
+		err := env.iptbl.AppendUnique("nat", NAT_POST_CHAIN, "-o", env.cfconfig.CfNetOvsPort, "-p", "tcp",
+									 "-m", "tcp", "--dport", cport, "-j", "SNAT", "--to-source",
+									 env.cfconfig.CfNetIntfAddress)
+		if err != nil {
+			env.log.Warning("Failed to add post-routing iptables rule: ", err)
+		}
+	}
 }
 
-func (env *CfEnvironment) cfAppDeleted(ctId *string) {
+func (env *CfEnvironment) updatePreNatRule(ctId *string, ep *etcd.EpInfo, portmap []etcd.PortMap) {
+	ctIp := net.ParseIP(ep.IpAddress)
+	if ctIp == nil || (env.cfNetv4 && ctIp.To4() == nil) {
+		return
+	}
+	old_pm := env.ctPortMap[*ctId]
+	new_pm := make(map[uint32]uint32)
+	for _, ch := range portmap {
+		err := env.iptbl.AppendUnique("nat", NAT_PRE_CHAIN, "-d", env.cfconfig.CellAddress, "-p", "tcp",
+									 "--dport", fmt.Sprintf("%d", ch.HostPort),
+									 "-j", "DNAT", "--to-destination",
+									 ep.IpAddress + ":" + fmt.Sprintf("%d", ch.ContainerPort))
+		if err != nil {
+			env.log.Warning(fmt.Sprintf("Failed to add pre-routing iptables rule for %d: %v", *ctId, err))
+		}
+		new_pm[ch.HostPort] = ch.ContainerPort
+		delete(old_pm, ch.HostPort)
+	}
+	for hp, cp := range old_pm {
+		args := []string{"-d", env.cfconfig.CellAddress, "-p", "tcp", "--dport",
+						 fmt.Sprintf("%d", hp), "-j", "DNAT", "--to-destination",
+						 ep.IpAddress + ":" + fmt.Sprintf("%d", cp)}
+		exist, _ := env.iptbl.Exists("nat", NAT_PRE_CHAIN, args...)
+		if !exist {
+			continue
+		}
+		err := env.iptbl.Delete("nat", NAT_PRE_CHAIN, args...)
+		if err != nil {
+			env.log.Warning(fmt.Sprintf("Failed to delete pre-routing iptables rule for %d: %v", *ctId, err))
+		}
+	}
+	env.ctPortMap[*ctId] = new_pm
+}
+
+func (env *CfEnvironment) cfAppDeleted(ctId *string, ep *etcd.EpInfo) {
 	env.agent.indexMutex.Lock()
-	defer env.agent.indexMutex.Unlock()
 	env.agent.epDeleted(ctId)
+	env.agent.indexMutex.Unlock()
+
+	if ep == nil {
+		return
+	}
+	env.updatePreNatRule(ctId, ep, nil)
+	delete(env.ctPortMap, *ctId)
+}
+
+func (env *CfEnvironment) setupLegacyCfNet() error {
+	// set ip to interface that receives legacy CF networking traffic
+	intfIp := net.ParseIP(env.cfconfig.CfNetIntfAddress)
+	if intfIp == nil || (env.cfNetv4 && intfIp.To4() == nil) {
+		err := fmt.Errorf("CF legacy network interface IP is not a valid IP address")
+		return err
+	}
+	link, err := netlink.LinkByName(env.cfconfig.CfNetOvsPort)
+	if err != nil {
+		return err
+	}
+	linkAddr := netlink.Addr{IPNet: netlink.NewIPNet(intfIp)}
+	linkAddr.Scope = syscall.IFA_LOCAL
+	fam := netlink.FAMILY_V4
+	if !env.cfNetv4 {
+		fam = netlink.FAMILY_V6
+	}
+	allAddr, err := netlink.AddrList(link, fam)
+	if err != nil {
+		return err
+	}
+	addrFound := false
+	for _, a := range allAddr {
+		if a.Equal(linkAddr) {
+			addrFound = true
+			break
+		}
+	}
+	if !addrFound {
+		if err := netlink.AddrAdd(link, &linkAddr); err != nil {
+			return err
+		}
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return err
+	}
+
+	// set routing rules to redirect traffic to the interface
+	for _, n := range env.agent.config.NetConfig {
+		dst := net.IPNet{IP: n.Subnet.IP, Mask: n.Subnet.Mask}
+		route := netlink.Route{Dst: &dst, Gw: intfIp}
+		if err := netlink.RouteReplace(&route); err != nil {
+			return err
+		}
+	}
+
+	// clear or create our iptables rule chains
+	if err := env.iptbl.ClearChain("nat", NAT_PRE_CHAIN); err != nil {
+		return err
+	}
+	if err := env.iptbl.ClearChain("nat", NAT_POST_CHAIN); err != nil {
+		return err
+	}
+	// Link our chains from the pre/post-routing chains
+	if err := env.iptbl.AppendUnique("nat", "PREROUTING", "-j", NAT_PRE_CHAIN); err != nil {
+		return err
+	}
+	if err := env.iptbl.AppendUnique("nat", "POSTROUTING", "-j", NAT_POST_CHAIN); err != nil {
+		return err
+	}
+	env.cfNetLink = link
+	return nil
+}
+
+func (env *CfEnvironment) updateLegacyCfNetService(portmap []etcd.PortMap) error {
+	// should be called with agent.indexMutex held
+	uuid := "cf-net-" + env.cfconfig.CellID
+	new_svc := opflexService{Uuid: uuid,
+							DomainPolicySpace: env.agent.config.AciVrfTenant,
+							DomainName: env.agent.config.AciVrf,
+							ServiceMac: env.cfNetLink.Attrs().HardwareAddr.String(),
+							InterfaceName: env.cfconfig.CfNetOvsPort}
+	for _, pm := range portmap {
+		svc_map := opflexServiceMapping{ServiceIp: env.cfconfig.CfNetIntfAddress,
+									   ServicePort: uint16(pm.ContainerPort),
+									   NextHopIps: make([]string, 0)}
+		new_svc.ServiceMappings = append(new_svc.ServiceMappings, svc_map)
+	}
+	exist, ok := env.agent.opflexServices[uuid]
+	if !ok || !reflect.DeepEqual(*exist, new_svc) {
+		env.agent.opflexServices[uuid] = &new_svc
+		env.agent.syncServices()
+	}
+	return nil
 }

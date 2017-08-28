@@ -267,7 +267,7 @@ func (agent *HostAgent) cleanupSetup() {
 		logger := agent.log.WithFields(logrus.Fields{
 			"podkey": podkey,
 		})
-		
+		// TODO Lookup container in epIdx
 		if strings.Contains(podkey, "_cf_") {
 			continue
 		}

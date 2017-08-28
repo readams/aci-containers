@@ -164,21 +164,25 @@ func (env *CfEnvironment) handleEtcdContainerNode(action *string, node *etcdclie
 		}
 
 		env.log.Info(fmt.Sprintf("Etcd udpate event for Container %s - %+v", ctId, ep))
-		
+
 		env.indexLock.Lock()
 		env.epIdx[ctId] = ep
 		env.indexLock.Unlock()
 
-		metaKey := "_cf_/" + ctId
-		env.cfAppChanged(&ctId, &metaKey)
+		env.cfAppChanged(&ctId, &ep)
 	}
 	if deleted {
 		env.log.Info("Etcd delete event for Container ", ctId)
 		env.indexLock.Lock()
+		ep, ok := env.epIdx[ctId]
 		delete(env.epIdx, ctId)
 		env.indexLock.Unlock()
 
-		env.cfAppDeleted(&ctId)
+		if ok {
+			env.cfAppDeleted(&ctId, &ep)
+		} else {
+			env.cfAppDeleted(&ctId, nil)
+		}
 	}
 	return nil
 }

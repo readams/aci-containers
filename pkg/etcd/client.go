@@ -45,10 +45,17 @@ type GroupInfo struct {
 	Group           string        `json:"tenant"`
 }
 
+type PortMap struct {
+	ContainerPort   uint32         `json:"container_port"`
+	HostPort        uint32         `json:"host_port"`
+}
+
 type EpInfo struct {
 	AppId               string        `json:"app_id"`
 	AppName             string        `json:"app_name"`
+	IpAddress           string        `json:"ip_address"`
 	InstanceIndex       int32         `json:"instance_index"`
+	PortMapping         []PortMap     `json:"port_mapping"`
 	EpgTenant           string        `json:"epg_tenant"`
 	Epg                 string        `json:"epg"`
 	SecurityGroups      []GroupInfo   `json:"sg"`

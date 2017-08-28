@@ -50,6 +50,7 @@ type AppUpdateInfo struct {
 	ContainerId     string
 	InstanceIndex   int32
 	IpAddress       string
+	Ports           []models.PortMapping
 	CellId          string
 	Staging         bool
 	Deleted         bool
@@ -60,6 +61,7 @@ type ActualLRPInfo struct {
     CellId       string
     IpAddress    string
     Index        int32
+    Ports        []models.PortMapping
 }
 
 func (env *CfEnvironment) initBbsEventListener(appCh chan<- interface{}, stopCh <-chan struct{}) {
@@ -171,12 +173,16 @@ func (env *CfEnvironment) processActualLrp(alrpg *models.ActualLRPGroup,
 		cellId := alrpg.Instance.CellId
 		addr := alrpg.Instance.InstanceAddress
 		index := alrpg.Instance.Index
+		ports := make([]models.PortMapping, 0, len(alrpg.Instance.Ports))
+		for _, p := range alrpg.Instance.Ports {
+			ports = append(ports, *p)
+		}
 
 		as, ok := dlrpInfo[pguid]
 		if ok {
 			upd = &AppUpdateInfo{AppId: as.AppId, SpaceId: as.SpaceId, Staging: false,
 								CellId: cellId, ContainerId: contId, IpAddress: addr,
-								AppName: as.AppName, InstanceIndex: index,
+								AppName: as.AppName, InstanceIndex: index, Ports: ports,
 								Deleted: deleted}
 			if !deleted {
 				alrpInfo[contId] = as
@@ -184,7 +190,7 @@ func (env *CfEnvironment) processActualLrp(alrpg *models.ActualLRPGroup,
 		} else if !deleted {
 			env.log.Debug("Pending LRP ProcessGuid " + pguid + ", containerId " + contId)
 			pendingDlrp[pguid] = append(pendingDlrp[pguid],
-									    ActualLRPInfo{contId, cellId, addr, index})
+									    ActualLRPInfo{contId, cellId, addr, index, ports})
 		}
 
 		if deleted {
@@ -330,7 +336,7 @@ func (env *CfEnvironment) initBbsAppListener(isTask bool, appCh chan<- interface
 						upd := AppUpdateInfo{AppId: as.AppId, SpaceId: as.SpaceId, Staging: false,
 											 ContainerId: actual.InstanceGuid, CellId: actual.CellId,
 											 IpAddress: actual.IpAddress, Deleted: false,
-											 InstanceIndex: actual.Index,
+											 InstanceIndex: actual.Index, Ports: actual.Ports,
 											 AppName: as.AppName}
 						appUpdates = append(appUpdates, upd)
 					}
@@ -364,6 +370,7 @@ type ContainerInfo struct {
 	CellId          string
 	InstanceIndex   int32
 	IpAddress       string
+	Ports           []models.PortMapping
 	AppId           string
 	Staging         bool
 }
@@ -546,7 +553,8 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <
 																CellId: upd.CellId,
 																IpAddress: upd.IpAddress,
 																InstanceIndex: upd.InstanceIndex,
-																Staging: upd.Staging}
+																Staging: upd.Staging,
+																Ports: upd.Ports}
 				} else {
 					if upd.AppId != "" {
 						c.AppId = upd.AppId
@@ -558,6 +566,7 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <
 						c.IpAddress = upd.IpAddress
 					}
 					c.InstanceIndex = upd.InstanceIndex
+					c.Ports = upd.Ports
 					env.contIdx[upd.ContainerId] = c
 				}
 				contChanged = append(contChanged, upd.ContainerId)
@@ -646,8 +655,13 @@ func (env *CfEnvironment) notifyContainerUpdate(contId string) {
 		ep := etcd.EpInfo{AppId: cinfo.AppId,
 						  AppName: appInfo.AppName,
 						  InstanceIndex: cinfo.InstanceIndex,
+						  IpAddress: cinfo.IpAddress,
 						  EpgTenant: env.cont.config.DefaultEg.PolicySpace,
 						  Epg: env.cont.config.DefaultEg.Name}
+		for _, pm := range cinfo.Ports {
+			ep.PortMapping = append(ep.PortMapping,
+								    etcd.PortMap{ContainerPort: pm.ContainerPort, HostPort: pm.HostPort})
+		}
 		ep.SecurityGroups = append(ep.SecurityGroups,
 								  etcd.GroupInfo{Group: env.cont.aciNameForKey("hpp", "static"),
 												 Tenant: env.cont.config.AciPolicyTenant})
@@ -811,6 +825,7 @@ func (env *CfEnvironment) initNetworkPolicyPoller(stopCh <-chan struct{}) {
 	var errDelayTime time.Duration = 10
 	timer := time.NewTimer(1 * time.Second)
 	oldRespHash := uint64(0)
+	notifyChannel := true
 
 	for {
 		select {
@@ -887,7 +902,10 @@ func (env *CfEnvironment) initNetworkPolicyPoller(stopCh <-chan struct{}) {
 			}
 			env.indexLock.Unlock()
 			oldRespHash = newRespHash
-			env.idxStatusChan <- "net-policy-ready"
+			if notifyChannel {
+				env.idxStatusChan <- "net-policy-ready"
+				notifyChannel = false
+			}
 			timer.Reset(time.Duration(env.cfconfig.NetPolPollingInterval) *
 						time.Second)
 		}
