@@ -379,7 +379,6 @@ type AppInfo struct {
 	AppId             string
 	SpaceId           string
 	AppName           string
-	NetworkPolicies   []string
 	ContainerIps      map[string]string
 }
 
@@ -394,6 +393,11 @@ type SpaceInfo struct {
 type SecurityGroupInfo struct {
 	cfclient.SecGroup
 	RulesHash      uint64
+}
+
+type IsoSegInfo struct {
+	Id              string
+	Name            string
 }
 
 func hashJsonSerializable(obj interface{}) (uint64, error) {
@@ -416,17 +420,34 @@ func (env *CfEnvironment) fetchSpaceInfo(spaceId *string) (*SpaceInfo, []cfclien
 		env.log.Error("Error fetching info for space " + *spaceId + ": ", err)
 		return nil, nil, err
 	}
+	spi := SpaceInfo{SpaceId: sp.Guid, OrgId: sp.OrganizationGuid}
+
+	// fetch isolation segment info
+	isoseg, err := env.ccClient.GetSpaceIsolationSegment(sp.Guid)
+	if err != nil {
+		env.log.Error("Error fetching isolation segment for space " + *spaceId + ": ", err)
+		return &spi, nil, err
+	}
+	if isoseg == "" {
+		isoseg, err = env.ccClient.GetOrgDefaultIsolationSegment(sp.OrganizationGuid)
+		if err != nil {
+			env.log.Error("Error fetching default segment for org " + sp.OrganizationGuid + ": ", err)
+			return &spi, nil, err
+		}
+	}
+	spi.IsolationSegment = isoseg
+
+	// fetch ASG info
 	runsg, err := env.ccClient.ListSecGroupsBySpace(*spaceId, false)
 	if err != nil {
 		env.log.Error("Error fetching running ASGs for space " + *spaceId + ": ", err)
-		return nil, nil, err
+		return &spi, nil, err
 	}
 	stagesg, err := env.ccClient.ListSecGroupsBySpace(*spaceId, true)
 	if err != nil {
 		env.log.Error("Error fetching staging ASGs for space " + *spaceId + ": ", err)
-		return nil, nil, err
+		return &spi, nil, err
 	}
-	spi := SpaceInfo{SpaceId: sp.Guid, OrgId: sp.OrganizationGuid}
 	for _, sg := range runsg {
 		spi.RunningSecurityGroups = append(spi.RunningSecurityGroups, sg.Guid)
 	}
@@ -455,8 +476,6 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <
 		}
 		return false
 	}
-
-	// TODO cleanup stale entries from etcd
 
 	for {
 		select {
@@ -514,6 +533,13 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <
 					}
 					// env.log.Debug(fmt.Sprintf("Space info: %+v", *spi))
 				}
+				var iseg *cfclient.IsolationSegment
+				if spi != nil && spi.IsolationSegment != "" {
+					iseg, err = env.ccClient.GetIsolationSegmentByGUID(spi.IsolationSegment)
+					if err != nil {
+						// TODO need to retry
+					}
+				}
 
 				// update the indexes
 				env.indexLock.Lock()
@@ -526,6 +552,10 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <
 				}
 				if spi != nil {
 					env.spaceIdx[upd.SpaceId] = *spi
+				}
+				if iseg != nil {
+					env.isoSegIdx[iseg.GUID] = IsoSegInfo{Id: iseg.GUID, Name: iseg.Name}
+					// TODO: Check if name has changed, and if so update all containers in the isolation segment
 				}
 
 				// process Apps
@@ -632,6 +662,9 @@ func (env *CfEnvironment) notifyContainerUpdate(contId string) {
 	if !ok || cinfo.AppId == "" {
 		return
 	}
+	epgTenant := env.cont.config.DefaultEg.PolicySpace
+	epg := env.cont.config.DefaultEg.Name
+
 	appInfo, ok := env.appIdx[cinfo.AppId]
 	var sg *[]string
 	if ok && appInfo.SpaceId != "" {
@@ -641,6 +674,9 @@ func (env *CfEnvironment) notifyContainerUpdate(contId string) {
 				sg = &spaceInfo.StagingSecurityGroups
 			} else {
 				sg = &spaceInfo.RunningSecurityGroups
+			}
+			if is := env.isoSegIdx[spaceInfo.IsolationSegment].Name; is != "" {
+				epg = env.cfconfig.DefaultAppProfile + "|" + is
 			}
 		}
 	}
@@ -656,8 +692,8 @@ func (env *CfEnvironment) notifyContainerUpdate(contId string) {
 						  AppName: appInfo.AppName,
 						  InstanceIndex: cinfo.InstanceIndex,
 						  IpAddress: cinfo.IpAddress,
-						  EpgTenant: env.cont.config.DefaultEg.PolicySpace,
-						  Epg: env.cont.config.DefaultEg.Name}
+						  EpgTenant: epgTenant,
+						  Epg: epg}
 		for _, pm := range cinfo.Ports {
 			ep.PortMapping = append(ep.PortMapping,
 								    etcd.PortMap{ContainerPort: pm.ContainerPort, HostPort: pm.HostPort})

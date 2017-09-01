@@ -78,6 +78,42 @@ func (ccClient *CcClient) ListSecGroupsBySpace(spaceGuid string, staging bool) (
 	return secGroups, nil
 }
 
+func (ccClient *CcClient) GetOrgDefaultIsolationSegment(orgGuid string) (string, error) {
+	requestUrl := "/v3/organizations/" + orgGuid + "/relationships/default_isolation_segment"
+	return ccClient.getIsolationSegment(requestUrl)
+}
+
+func (ccClient *CcClient) GetSpaceIsolationSegment(spaceGuid string) (string, error) {
+	requestUrl := "/v3/spaces/" + spaceGuid + "/relationships/isolation_segment"
+	return ccClient.getIsolationSegment(requestUrl)
+}
+
+func (ccClient *CcClient) getIsolationSegment(requestURL string) (string, error) {
+	r := ccClient.NewRequest("GET", requestURL)
+	resp, err := ccClient.DoRequest(r)
+
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	resBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var isr struct {
+		Data         struct {
+			Guid     string                `json:"guid"`
+		}                                  `json:"data"`
+	}
+
+	err = json.Unmarshal(resBody, &isr)
+	if err != nil {
+		return "", err
+	}
+	return isr.Data.Guid, nil
+}
+
 func (ccClient *CcClient) GetAppSummary(appGuid string) (string, error) {
 	requestURL := "/v2/apps/" + appGuid + "/summary"
 	

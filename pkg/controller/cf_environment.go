@@ -52,6 +52,7 @@ type CfEnvironment struct {
 	spaceIdx     map[string]SpaceInfo
 	asgIdx       map[string]SecurityGroupInfo
 	netpolIdx    map[string]map[string][]cfapi.Destination
+	isoSegIdx    map[string]IsoSegInfo
 
 	idxStatusChan   chan string
 	log          *logrus.Logger
@@ -82,6 +83,8 @@ type CfConfig struct {
 
 	AppPort                            string                `json:"app_port"`
 	SshPort                            string                `json:"ssh_port"`
+
+	DefaultAppProfile                  string                `json:"default_app_profile"`
 }
 
 func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironment, error) {
@@ -188,6 +191,7 @@ func (env *CfEnvironment) Init(cont *AciController) error {
 	env.spaceIdx = make(map[string]SpaceInfo)
 	env.asgIdx = make(map[string]SecurityGroupInfo)
 	env.netpolIdx = make(map[string]map[string][]cfapi.Destination)
+	env.isoSegIdx = make(map[string]IsoSegInfo)
 
 	env.idxStatusChan = make(chan string)
 	return nil
