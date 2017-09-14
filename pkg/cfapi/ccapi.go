@@ -17,18 +17,32 @@ package cfapi
 import (
 	"encoding/json"
 	"io/ioutil"
+	"strings"
 
-	"github.com/Sirupsen/logrus"
-	
 	cfclient "github.com/cloudfoundry-community/go-cfclient"
 )
 
-type CcClient struct {
-	cfclient.Client
-	log *logrus.Logger
+type CcClient interface {
+	GetSpaceByGuid(spaceGUID string) (cfclient.Space, error)
+
+	ListSecGroupsBySpace(spaceGuid string, staging bool) ([]cfclient.SecGroup, error)
+
+	GetIsolationSegmentByGUID(guid string) (*cfclient.IsolationSegment, error)
+
+	GetOrgDefaultIsolationSegment(orgGuid string) (string, error)
+
+	GetSpaceIsolationSegment(spaceGuid string) (string, error)
+
+	GetUserRoleInfo(userGuid string) (*UserRoleInfo, error)
+
+	GetAppSpace(appGuid string) (string, error)
 }
 
-func NewCcClient(apiUrl string, username string, password string, log *logrus.Logger) (*CcClient, error) {
+type ccClientImpl struct {
+	cfclient.Client
+}
+
+func NewCcClient(apiUrl string, username string, password string) (CcClient, error) {
 	ccConfig := &cfclient.Config{
 		ApiAddress: apiUrl,
 		Username: username,
@@ -39,10 +53,10 @@ func NewCcClient(apiUrl string, username string, password string, log *logrus.Lo
 	if err != nil {
 		return nil, err
 	}
-	return &CcClient{*cfc, log}, nil
+	return &ccClientImpl{*cfc}, nil
 }
 
-func (ccClient *CcClient) ListSecGroupsBySpace(spaceGuid string, staging bool) ([]cfclient.SecGroup, error) {
+func (ccClient *ccClientImpl) ListSecGroupsBySpace(spaceGuid string, staging bool) ([]cfclient.SecGroup, error) {
 	stageStr := ""
 	if staging {
 		stageStr = "staging_"
@@ -78,17 +92,17 @@ func (ccClient *CcClient) ListSecGroupsBySpace(spaceGuid string, staging bool) (
 	return secGroups, nil
 }
 
-func (ccClient *CcClient) GetOrgDefaultIsolationSegment(orgGuid string) (string, error) {
+func (ccClient *ccClientImpl) GetOrgDefaultIsolationSegment(orgGuid string) (string, error) {
 	requestUrl := "/v3/organizations/" + orgGuid + "/relationships/default_isolation_segment"
 	return ccClient.getIsolationSegment(requestUrl)
 }
 
-func (ccClient *CcClient) GetSpaceIsolationSegment(spaceGuid string) (string, error) {
+func (ccClient *ccClientImpl) GetSpaceIsolationSegment(spaceGuid string) (string, error) {
 	requestUrl := "/v3/spaces/" + spaceGuid + "/relationships/isolation_segment"
 	return ccClient.getIsolationSegment(requestUrl)
 }
 
-func (ccClient *CcClient) getIsolationSegment(requestURL string) (string, error) {
+func (ccClient *ccClientImpl) getIsolationSegment(requestURL string) (string, error) {
 	r := ccClient.NewRequest("GET", requestURL)
 	resp, err := ccClient.DoRequest(r)
 
@@ -114,8 +128,64 @@ func (ccClient *CcClient) getIsolationSegment(requestURL string) (string, error)
 	return isr.Data.Guid, nil
 }
 
-func (ccClient *CcClient) GetAppSummary(appGuid string) (string, error) {
-	requestURL := "/v2/apps/" + appGuid + "/summary"
+func (ccClient *ccClientImpl) GetUserRoleInfo(userGuid string) (*UserRoleInfo, error) {
+	r := ccClient.NewRequest("GET", "/v2/users/" + userGuid + "/summary")
+	resp, err := ccClient.DoRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	resBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	type EntityMeta struct {
+		Meta         cfclient.Meta                    `json:"metadata"`
+	}
+	var userSummaryResp struct {
+		Meta     cfclient.Meta                        `json:"metadata"`
+		Entity   struct {
+		    Organizations               []EntityMeta      `json:"organizations"`
+		    AuditedOrganizations        []EntityMeta      `json:"audited_organizations"`
+		    ManagedOrganizations        []EntityMeta      `json:"managed_organizations"`
+		    BillingManagedOrganizations []EntityMeta      `json:"billing_managed_organizations"`
+		    Spaces                      []EntityMeta      `json:"spaces"`
+		    AuditedSpaces               []EntityMeta      `json:"audited_spaces"`
+		    ManagedSpaces               []EntityMeta      `json:"managed_spaces"`
+		}                                             `json:"entity"`
+	}
+	err = json.Unmarshal(resBody, &userSummaryResp)
+	if err != nil {
+		return nil, err
+	}
+	ri := NewUserRoleInfo(userSummaryResp.Meta.Guid)
+	for _, e := range userSummaryResp.Entity.Organizations {
+		ri.Organizations[e.Meta.Guid] = struct{}{}
+	}
+	for _, e := range userSummaryResp.Entity.AuditedOrganizations {
+		ri.AuditedOrganizations[e.Meta.Guid] = struct{}{}
+	}
+	for _, e := range userSummaryResp.Entity.ManagedOrganizations {
+		ri.ManagedOrganizations[e.Meta.Guid] = struct{}{}
+	}
+	for _, e := range userSummaryResp.Entity.BillingManagedOrganizations {
+		ri.BillingManagedOrganizations[e.Meta.Guid] = struct{}{}
+	}
+	for _, e := range userSummaryResp.Entity.Spaces {
+		ri.Spaces[e.Meta.Guid] = struct{}{}
+	}
+	for _, e := range userSummaryResp.Entity.AuditedSpaces {
+		ri.AuditedSpaces[e.Meta.Guid] = struct{}{}
+	}
+	for _, e := range userSummaryResp.Entity.ManagedSpaces {
+		ri.ManagedSpaces[e.Meta.Guid] = struct{}{}
+	}
+	return ri, nil
+}
+
+func (ccClient *ccClientImpl) GetAppSpace(appGuid string) (string, error) {
+	requestURL := "/v3/apps/" + appGuid
 	
 	r := ccClient.NewRequest("GET", requestURL)
 	resp, err := ccClient.DoRequest(r)
@@ -128,64 +198,19 @@ func (ccClient *CcClient) GetAppSummary(appGuid string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	return string(resBody), nil
-}
 
-type AppUsageEventResponse struct {
-	Results   int                `json:"total_results"`
-	Pages     int                `json:"total_pages"`
-	PrevURL   string             `json:"prev_url"`
-	NextURL   string             `json:"next_url"`
-	Resources []AppUsageEventResource `json:"resources"`
-}
-
-type AppUsageEventResource struct {
-	Meta   cfclient.Meta           `json:"metadata"`
-	Entity AppUsageEventEntity     `json:"entity"`
-}
-
-type AppUsageEventEntity struct {
-	Guid  string
-	State string           `json:"state"`
-	AppGuid string         `json:"app_guid"`
-	ParentAppGuid string   `json:"parent_app_guid"`
-	AppName string         `json:"app_name"`
-	SpaceGuid string       `json:"space_guid"`
-	SpaceName string       `json:"space_name"`
-	OrgGuid string         `json:"org_guid"`
-}
-
-func (ccClient *CcClient) GetAppUsageEvents(afterGuid string) ([]AppUsageEventEntity, error) {
-	requestURL := "/v2/app_usage_events"
-	if afterGuid != "" {
-		requestURL = requestURL + "?after_guid=" + afterGuid
+	var appResp struct {
+		Guid                     string           `json:"guid"`
+		Links struct {
+			Space struct {
+				Href             string                   `json:"href"`
+			}                                         `json:"space"`
+		}                                         `json:"links"`
 	}
-	
-	var events []AppUsageEventEntity
-	for requestURL != "" {
-		ccClient.log.Debug("Invoking GET ", requestURL)
-		r := ccClient.NewRequest("GET", requestURL)
-		resp, err := ccClient.DoRequest(r)
-	
-		if err != nil {
-			return nil, err
-		}
-		resBody, err := ioutil.ReadAll(resp.Body)	
-		if err != nil {
-			return nil, err
-		}
-		
-		var respDecoded AppUsageEventResponse
-		err = json.Unmarshal(resBody, &respDecoded)
-		if err != nil {
-			return nil, err
-		}
-		for _, er := range respDecoded.Resources {
-			er.Entity.Guid = er.Meta.Guid
-			events = append(events, er.Entity)
-		}
-		requestURL = respDecoded.NextURL
-		resp.Body.Close()
+	err = json.Unmarshal(resBody, &appResp)
+	if err != nil {
+		return "", err
 	}
-	return events, nil
+	parts := strings.Split(appResp.Links.Space.Href, "/")
+	return parts[len(parts)-1], nil
 }

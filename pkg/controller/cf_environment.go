@@ -15,11 +15,13 @@
 package controller
 
 import (
+	"database/sql"
 	"encoding/json"
-	"fmt"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -41,10 +43,12 @@ type CfEnvironment struct {
 	cfconfig     *CfConfig
 
 	bbsClient    bbs.Client
-	ccClient     *cfapi.CcClient
-	etcdClient   etcdclient.Client
+	ccClient     cfapi.CcClient
+	etcdKeysApi  etcdclient.KeysAPI
 	netpolClient *cfapi.PolicyClient
+	cfAuthClient cfapi.CfAuthClient
 	cfLogger     lager.Logger
+	db           *sql.DB
 
 	indexLock    sync.Locker
 	contIdx      map[string]ContainerInfo
@@ -75,11 +79,21 @@ type CfConfig struct {
 	EtcdClientCertFile                 string                `json:"etcd_client_cert_file"`
 	EtcdClientKeyFile                  string                `json:"etcd_client_key_file"`
 
+	UaaUrl                             string                `json:"uaa_url,omitempty"`
+	UaaCACertFile                      string                `json:"uaa_ca_cert_file"`
+	UaaClientName                      string                `json:"uaa_client_name"`
+	UaaClientSecret                    string                `json:"uaa_client_secret"`
+
 	NetPolApiUrl                       string                `json:"network_policy_api_url"`
 	NetPolCACertFile                   string                `json:"network_policy_ca_cert_file"`
 	NetPolClientCertFile               string                `json:"network_policy_client_cert_file"`
 	NetPolClientKeyFile                string                `json:"network_policy_client_key_file"`
 	NetPolPollingInterval              int                   `json:"network_policy_polling_interval_sec"`
+
+	DbType                             string                `json:"db_type"`
+	DbDsn                              string                `json:"db_dsn"`
+
+	ApiPathPrefix                      string                `json:"api_path_prefix"`
 
 	AppPort                            string                `json:"app_port"`
 	SshPort                            string                `json:"ssh_port"`
@@ -112,6 +126,9 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 	}
 	if cfconfig.NetPolPollingInterval <= 0 {
 		cfconfig.NetPolPollingInterval = 1
+	}
+	if cfconfig.ApiPathPrefix == "" {
+		cfconfig.ApiPathPrefix = "/networking-aci"
 	}
 
 	log.WithFields(logrus.Fields{
@@ -149,6 +166,7 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 		log.Error("Failed to create Etcd client: ", err)
 		return nil, err
 	}
+	etcdKeysApi := etcdclient.NewKeysAPI(etcdClient)
 
 	netpolClient, err := cfapi.NewNetPolClient(cfconfig.NetPolApiUrl,
 											  cfconfig.NetPolCACertFile,
@@ -159,8 +177,16 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 		return nil, err
 	}
 
+	authClient, err := cfapi.NewCfAuthClient(cfconfig.UaaUrl, cfconfig.UaaCACertFile,
+											cfconfig.UaaClientName, cfconfig.UaaClientSecret)
+	if err != nil {
+		log.Error("Failed to create UAA client: ", err)
+		return nil, err
+	}
+
 	return &CfEnvironment{cfconfig: cfconfig, bbsClient: bbsClient,
-						 etcdClient: etcdClient, netpolClient: netpolClient,
+						 etcdKeysApi: etcdKeysApi, netpolClient: netpolClient,
+						 cfAuthClient: authClient,
 						 indexLock: &sync.Mutex{}, log: log}, nil
 }
 
@@ -193,17 +219,38 @@ func (env *CfEnvironment) Init(cont *AciController) error {
 	env.netpolIdx = make(map[string]map[string][]cfapi.Destination)
 	env.isoSegIdx = make(map[string]IsoSegInfo)
 
+	var err error
+	env.db, err = sql.Open(env.cfconfig.DbType, env.cfconfig.DbDsn)
+	if err != nil {
+		env.log.Error("Unable to open SQL DB: ", err)
+		return err
+	}
+
 	env.idxStatusChan = make(chan string)
 	return nil
 }
 
 func (env *CfEnvironment) PrepareRun(stopCh <-chan struct{}) error {
-	maxattempts := 240                 // TODO move the connect loop to app-index builder
 	var err error
+
+	// test DB connectivity
+	if err = env.db.Ping(); err != nil {
+		env.log.Error("Unable to connect to SQL DB: ", err)
+		return err
+	}
+	if err = env.RunDbMigration(); err != nil {
+		env.log.Error("Failed to run DB migration: ", err)
+		return err
+	}
+
+	epg_anno_handler := EpgAnnotationHttpHandler{env: env}
+	http.Handle(epg_anno_handler.Path(), &epg_anno_handler)
+
+	maxattempts := 240                 // TODO move the connect loop to app-index builder
 	for env.ccClient == nil && maxattempts > 0 {
 		maxattempts--
 		ccClient, err := cfapi.NewCcClient(env.cfconfig.CCApiUrl, env.cfconfig.CCApiUsername,
-										  env.cfconfig.CCApiPassword, env.log)
+										  env.cfconfig.CCApiPassword)
 		if err != nil {
 			env.log.Error("Failed to create CC API client: ", err)
 			time.Sleep(5 * time.Second)
@@ -335,7 +382,7 @@ func (env *CfEnvironment) initStaticHpp() {
 func (env *CfEnvironment) NodePodNetworkChanged(nodename string) {
 	if podnet, ok := env.cont.nodePodNetCache[nodename]; ok {
 		cellKey := etcd.CELL_KEY_BASE + "/" + nodename
-		kapi := etcdclient.NewKeysAPI(env.etcdClient)
+		kapi := env.etcdKeysApi
 		_, err := kapi.Set(context.Background(), cellKey + "/network", podnet.podNetIpsAnnotation, nil)
 		if err != nil {
 			env.log.Error("Error setting etcd net info for cell: ", err)

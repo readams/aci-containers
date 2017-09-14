@@ -53,7 +53,7 @@ func testController() *testAciController {
 	}
 
 	cont := &testAciController{
-		AciController: *NewController(NewConfig(), log),
+		AciController: *NewController(NewConfig(), &K8sEnvironment{}, log),
 	}
 
 	cont.fakeNamespaceSource = framework.NewFakeControllerSource()
