@@ -71,8 +71,14 @@ func (env *CfEnvironment) handleContainerUpdateLocked(contId string) {
 	if cinfo.CellId != "" {
 
 		env.cont.indexMutex.Lock()
+		env.LoadCellNetworkInfo(cinfo.CellId)
+		newCellSvc := env.LoadCellServiceInfo(cinfo.CellId)
 		env.cont.addPodToNode(cinfo.CellId, contId)
 		env.cont.indexMutex.Unlock()
+		if newCellSvc {
+			env.log.Info("Updating device-cluster for new cell %s", cinfo.CellId)
+			env.cont.updateDeviceCluster()
+		}
 
 		ctKey := etcd.CELL_KEY_BASE + "/" + cinfo.CellId + "/containers/" + cinfo.ContainerId
 		ep := etcd.EpInfo{AppId: cinfo.AppId,
@@ -136,6 +142,42 @@ func (env *CfEnvironment) handleAppUpdateLocked(appId string) {
 		return
 	}
 	env.log.Debug(fmt.Sprintf("App update : %+v", ainfo))
+
+	ai := etcd.AppInfo{}
+	if ainfo.VipV4 != "" {
+		ai.VirtualIp = append(ai.VirtualIp, ainfo.VipV4)
+	}
+	if ainfo.VipV6 != "" {
+		ai.VirtualIp = append(ai.VirtualIp, ainfo.VipV6)
+	}
+	for _, cip := range ainfo.ContainerIps {
+		ai.ContainerIps = append(ai.ContainerIps, cip)
+	}
+	{
+		aei_db := AppExtIpDb{}
+		txn, _ := env.db.Begin()
+		ips, err := aei_db.Get(txn, appId)
+		if err != nil {
+			env.log.Error("Failed to get app external IPs: ", err)
+		} else {
+			for _, ip := range ips {
+				ai.ExternalIp = append(ai.ExternalIp, ip.IP)
+			}
+		}
+		txn.Commit()
+	}
+	app_json, err := json.Marshal(ai)
+	if err != nil {
+		env.log.Error("Unable to serialize App info: ", err)
+	} else {
+		kapi := env.etcdKeysApi
+		appKey := etcd.APP_KEY_BASE + "/" + appId
+		_, err = kapi.Set(context.Background(), appKey, string(app_json), nil)
+		if err != nil {
+			env.log.Error("Error setting app info: ", err)
+		}
+	}
+
 	// find destination PolIds for which this App is a source
 	var dstPolIds []string
 	for k, info := range env.netpolIdx {
@@ -148,6 +190,12 @@ func (env *CfEnvironment) handleAppUpdateLocked(appId string) {
 		hpp := env.createHppForNetPol(&d)
 		env.cont.apicConn.WriteApicObjects("np:" + d, hpp)
 	}
+}
+
+func (env *CfEnvironment) handleAppUpdate(appId string) {
+	env.indexLock.Lock()
+	defer env.indexLock.Unlock()
+	env.handleAppUpdateLocked(appId)
 }
 
 func (env *CfEnvironment) updateAppContainersLocked(appId string) {

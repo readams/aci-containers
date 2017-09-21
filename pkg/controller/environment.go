@@ -31,6 +31,9 @@ type Environment interface {
 	PrepareRun(stopCh <-chan struct{}) error
 	InitStaticAciObjects()
 	NodePodNetworkChanged(nodeName string)
+	NodeServiceChanged(nodeName string)
+	VmmPolicy() string
+	ServiceBd() string
 }
 
 type K8sEnvironment struct {
@@ -77,6 +80,14 @@ func NewK8sEnvironment(config *ControllerConfig, log *logrus.Logger) (*K8sEnviro
 		return nil, err
 	}
 	return &K8sEnvironment{kubeClient: kubeClient, netPolClient: netPolClient, log: log}, nil
+}
+
+func (env *K8sEnvironment) VmmPolicy() string {
+	return "Kubernetes"
+}
+
+func (env *K8sEnvironment) ServiceBd() string {
+	return "kubernetes-service"
 }
 
 func (env *K8sEnvironment) Init(cont *AciController) error {
@@ -126,6 +137,10 @@ func (env *K8sEnvironment) NodePodNetworkChanged(nodename string) {
 	if exists && node != nil {
 		env.cont.nodeChanged(node)
 	}
+}
+
+func (env *K8sEnvironment) NodeServiceChanged(nodeName string) {
+	env.cont.updateServicesForNode(nodeName)
 }
 
 func (env *K8sEnvironment) PrepareRun(stopCh <-chan struct{}) error {

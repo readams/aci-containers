@@ -77,21 +77,26 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 	cellNetKey := cellKey + "/network"
 	ctBaseKey := cellKey + "/containers/"
 	w := kapi.Watcher(cellKey, &etcdclient.WatcherOptions{Recursive: true})
+	app_w := kapi.Watcher(etcd.APP_KEY_BASE,
+						  &etcdclient.WatcherOptions{Recursive: true})
 	cellNetNodeExists := false
 
-	// Get info about the cell-specific subtree
-	resp, err := kapi.Get(context.Background(), cellKey, &etcdclient.GetOptions{Recursive: true})
 	var nodes etcdclient.Nodes
-	if err != nil {
-		keyerr, ok := err.(etcdclient.Error)
-		if ok && keyerr.Code == etcdclient.ErrorCodeKeyNotFound {
-			env.log.Info(fmt.Sprintf("Etcd subtree %s doesn't exist yet", cellKey))
+	keys_to_watch := []string{cellKey, etcd.APP_KEY_BASE}
+	for _, key := range keys_to_watch {
+		resp, err := kapi.Get(context.Background(), key,
+							  &etcdclient.GetOptions{Recursive: true})
+		if err != nil {
+			keyerr, ok := err.(etcdclient.Error)
+			if ok && keyerr.Code == etcdclient.ErrorCodeKeyNotFound {
+				env.log.Info(fmt.Sprintf("Etcd subtree %s doesn't exist yet", key))
+			} else {
+				env.log.Error("Error fetching initial etcd subtree: ", err)
+				return err
+			}
 		} else {
-			env.log.Error("Error fetching initial etcd subtree for cell: ", err)
-			return err
+			etcd.FlattenNodes(resp.Node, &nodes)
 		}
-	} else {
-		etcd.FlattenNodes(resp.Node, &nodes)
 	}
 
 	handleEtcdNode := func (action *string, node *etcdclient.Node) error {
@@ -100,6 +105,8 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 		} else if node.Key == cellNetKey {
 			cellNetNodeExists = true
 			return env.handleEtcdCellNetworkNode(action, node)
+		} else if strings.HasPrefix(node.Key, etcd.APP_KEY_BASE + "/") {
+			return env.handleEtcdAppNode(action, node)
 		} else if strings.HasPrefix(node.Key, ctBaseKey) {
 			return env.handleEtcdContainerNode(action, node)
 		}
@@ -117,7 +124,7 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 	}
 	env.log.Debug(fmt.Sprintf("Handled %d initial etcd nodes", len(nodes)))
 
-	go func() {
+	watch_func := func(w etcdclient.Watcher) {
 		for {
 			resp, err := w.Next(context.Background())
 			if err != nil {
@@ -127,7 +134,11 @@ func (env *CfEnvironment) initEtcdListener(stopCh <-chan struct{}) error {
 			// env.log.Debug("Etcd event: ", resp)
 			handleEtcdNode(&resp.Action, resp.Node)
 		}
-	}()
+	}
+	// watch cells
+	go watch_func(w)
+	// watch apps
+	go watch_func(app_w)
 	return nil
 }
 
@@ -169,7 +180,7 @@ func (env *CfEnvironment) handleEtcdContainerNode(action *string, node *etcdclie
 		env.epIdx[ctId] = ep
 		env.indexLock.Unlock()
 
-		env.cfAppChanged(&ctId, &ep)
+		env.cfAppContainerChanged(&ctId, &ep)
 	}
 	if deleted {
 		env.log.Info("Etcd delete event for Container ", ctId)
@@ -179,9 +190,43 @@ func (env *CfEnvironment) handleEtcdContainerNode(action *string, node *etcdclie
 		env.indexLock.Unlock()
 
 		if ok {
-			env.cfAppDeleted(&ctId, &ep)
+			env.cfAppContainerDeleted(&ctId, &ep)
 		} else {
-			env.cfAppDeleted(&ctId, nil)
+			env.cfAppContainerDeleted(&ctId, nil)
+		}
+	}
+	return nil
+}
+
+func (env *CfEnvironment) handleEtcdAppNode(action *string, node *etcdclient.Node) error {
+	key_parts := strings.Split(node.Key, "/")
+	appId := key_parts[len(key_parts) - 1]
+	deleted := isDeleteAction(action)
+	if !deleted {
+		var app etcd.AppInfo
+		err := json.Unmarshal([]byte(node.Value), &app)
+		if err != nil {
+			env.log.Error("Error deserializing app node value: ", err)
+			return err
+		}
+
+		env.log.Info(fmt.Sprintf("Etcd udpate event for App %s - %+v", appId, app))
+		env.indexLock.Lock()
+		env.appIdx[appId] = app
+		env.indexLock.Unlock()
+
+		env.cfAppChanged(&appId, &app)
+	} else {
+		env.log.Info("Etcd delete event for App ", appId)
+		env.indexLock.Lock()
+		app, ok := env.appIdx[appId]
+		delete(env.appIdx, appId)
+		env.indexLock.Unlock()
+
+		if ok {
+			env.cfAppDeleted(&appId, &app)
+		} else {
+			env.cfAppDeleted(&appId, nil)
 		}
 	}
 	return nil

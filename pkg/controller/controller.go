@@ -267,36 +267,26 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 	cont.apicConn.AddSubscriptionDn(fmt.Sprintf("uni/tn-%s/out-%s",
 		cont.config.AciVrfTenant, cont.config.AciL3Out),
 		[]string{"fvRsCons"})
-	vmmpol := "Kubernetes"
-	if cont.config.EnvType == ENV_CF {
-		vmmpol = "OpenStack"
-		// TODO subscribe to vmmInjected objects for CF
-	} else {
-		vmmDn := fmt.Sprintf("comp/prov-%s/ctrlr-[%s]-%s/injcont",
-			vmmpol, cont.config.AciVmmDomain, cont.config.AciVmmController)
-		cont.apicConn.AddSubscriptionDn(vmmDn,
-			[]string{"vmmInjectedHost", "vmmInjectedNs",
-				"vmmInjectedContGrp", "vmmInjectedDepl",
-				"vmmInjectedSvc", "vmmInjectedReplSet"})
-	}
+	vmmDn := fmt.Sprintf("comp/prov-%s/ctrlr-[%s]-%s/injcont",
+		cont.env.VmmPolicy(), cont.config.AciVmmDomain, cont.config.AciVmmController)
+	cont.apicConn.AddSubscriptionDn(vmmDn,
+		[]string{"vmmInjectedHost", "vmmInjectedNs",
+			"vmmInjectedContGrp", "vmmInjectedDepl",
+			"vmmInjectedSvc", "vmmInjectedReplSet"})
 
-	if cont.config.EnvType == ENV_CF {
-		// TODO subscribe to opflexODev objects for CF
-	} else {
-		cont.apicConn.AddSubscriptionClass("opflexODev",
-			[]string{"opflexODev"},
-			fmt.Sprintf("and(eq(opflexODev.domName,\"%s\"),"+
-				"eq(opflexODev.ctrlrName,\"%s\"))",
-				cont.config.AciVmmDomain, cont.config.AciVmmController))
-	
-		cont.apicConn.SetSubscriptionHooks("opflexODev",
-			func(obj apicapi.ApicObject) bool {
-				cont.opflexDeviceChanged(obj)
-				return true
-			},
-			func(dn string) {
-				cont.opflexDeviceDeleted(dn)
-			})
-	}
+	cont.apicConn.AddSubscriptionClass("opflexODev",
+		[]string{"opflexODev"},
+		fmt.Sprintf("and(eq(opflexODev.domName,\"%s\"),"+
+			"eq(opflexODev.ctrlrName,\"%s\"))",
+			cont.config.AciVmmDomain, cont.config.AciVmmController))
+
+	cont.apicConn.SetSubscriptionHooks("opflexODev",
+		func(obj apicapi.ApicObject) bool {
+			cont.opflexDeviceChanged(obj)
+			return true
+		},
+		func(dn string) {
+			cont.opflexDeviceDeleted(dn)
+		})
 	go cont.apicConn.Run(stopCh)
 }

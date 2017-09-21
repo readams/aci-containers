@@ -38,11 +38,12 @@ func NewEtcdClient(etcdUrl string, caCertFile string, clientCertFile string,
 const (
 	ACI_KEY_BASE = "/aci"
 	CELL_KEY_BASE = "/aci/cells"
+	APP_KEY_BASE = "/aci/apps"
 )
 
 type GroupInfo struct {
-	Tenant          string        `json:"group"`
-	Group           string        `json:"tenant"`
+	Tenant          string        `json:"tenant"`
+	Group           string        `json:"group"`
 }
 
 type PortMap struct {
@@ -59,6 +60,12 @@ type EpInfo struct {
 	EpgTenant           string        `json:"epg_tenant"`
 	Epg                 string        `json:"epg"`
 	SecurityGroups      []GroupInfo   `json:"sg"`
+}
+
+type AppInfo struct {
+	ContainerIps        []string      `json:"container_ips"`
+	VirtualIp           []string      `json:"virtual_ip"`
+	ExternalIp          []string      `json:"external_ip"`
 }
 
 func FlattenNodes(nd *client.Node, nodes *client.Nodes) {

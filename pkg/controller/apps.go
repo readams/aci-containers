@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net"
 	"strings"
 	"reflect"
 	"time"
@@ -378,6 +379,8 @@ type AppInfo struct {
 	SpaceId           string
 	AppName           string
 	ContainerIps      map[string]string
+	VipV4             string
+	VipV6             string
 }
 
 type SpaceInfo struct {
@@ -570,6 +573,7 @@ func (env *CfEnvironment) initAppIndexBuilder(appCh <-chan interface{}, stopCh <
 						}
 					}
 					app.ContainerIps[upd.ContainerId] = upd.IpAddress
+					app.VipV4, app.VipV6 = env.getOrAllocateAppVip(upd.AppId, app.VipV4, app.VipV6)
 					env.appIdx[upd.AppId] = app
 					appChanged = append(appChanged, upd.AppId)
 				}
@@ -770,4 +774,198 @@ func (env *CfEnvironment) createHppForNetPol(polId *string) apicapi.ApicSlice {
 		hpp.AddChild(ingressSubj)
 	}
 	return apicapi.ApicSlice{hpp}
+}
+
+func (env *CfEnvironment) getOrAllocateAppVip(appId, curr_v4, curr_v6 string) (string, string) {
+	txn, _ := env.db.Begin()
+	defer txn.Commit()
+	ipdb := AppVipDb{}
+
+	db_v4, db_v6, err := ipdb.Get(txn, appId)
+	if err != nil {
+		env.log.Error("Failed to get app virtual IP: ", err)
+		return "", ""
+	}
+
+	var v4, v6 net.IP
+	var new_v4, new_v6 string
+	if db_v4 != "" {
+		v4 = net.ParseIP(db_v4)
+		if v4 != nil && db_v4 != curr_v4 && !env.appVips.V4.RemoveIp(v4) {
+			v4 = nil
+		}
+	}
+	if v4 == nil {
+		v4, _ = env.appVips.V4.GetIp()
+	}
+	if v4 != nil {
+		new_v4 = v4.String()
+	}
+
+	if db_v6 != "" {
+		v6 = net.ParseIP(db_v6)
+		if v6 != nil && db_v6 != curr_v6 && !env.appVips.V6.RemoveIp(v6) {
+			v6 = nil
+		}
+	}
+	if v6 == nil {
+		v6, _ = env.appVips.V6.GetIp()
+	}
+	if v6 != nil {
+		new_v6 = v6.String()
+	}
+
+	if db_v4 != new_v4 || db_v6 != new_v6 {
+		err = ipdb.Set(txn, appId, new_v4, new_v6)
+		if err != nil {
+			env.log.Error("Failed to set app virtual IP: ", err)
+			if v4 != nil {
+				env.appVips.V4.AddIp(v4)
+			}
+			if v6 != nil {
+				env.appVips.V6.AddIp(v6)
+			}
+			return "", ""
+		}
+	}
+	return new_v4, new_v6
+}
+
+func (env *CfEnvironment) LoadAppExtIps() {
+	txn, _ := env.db.Begin()
+	defer txn.Commit()
+	ipdb := AppExtIpDb{}
+
+	ips, err := ipdb.List(txn)
+	if err != nil {
+		env.log.Warn("Unable to load app external IPs from DB: ", err)
+		return
+	}
+
+	env.cont.indexMutex.Lock()
+	defer env.cont.indexMutex.Unlock()
+
+	for _, ipa := range ips {
+		alloc := env.cont.staticServiceIps
+		if ipa.Dynamic {
+			alloc = env.cont.serviceIps
+		}
+		ip := net.ParseIP(ipa.IP)
+		if ip != nil && ip.To4() != nil {
+			alloc.V4.RemoveIp(ip)
+		} else if ip != nil && ip.To16() != nil {
+			alloc.V6.RemoveIp(ip)
+		}
+	}
+}
+
+func (env *CfEnvironment) ManageAppExtIp(current []ExtIpAlloc, requestedStatic []ExtIpAlloc,
+	requestedDynamic bool) ([]ExtIpAlloc, error) {
+
+	currentDynamic := make([]*ExtIpAlloc, 0)
+	currentStatic := make(map[string]*ExtIpAlloc, 0)
+	for i, _ := range current {
+		if current[i].Dynamic {
+			currentDynamic = append(currentDynamic, &current[i])
+		} else {
+			currentStatic[current[i].IP] = &current[i]
+		}
+	}
+
+	env.cont.indexMutex.Lock()
+	defer env.cont.indexMutex.Unlock()
+
+	// cleanup function on errors
+	staticAllocatedV4 := make([]net.IP, 0)
+	staticAllocatedV6 := make([]net.IP, 0)
+	var err error
+	defer func() {
+		if err != nil {
+			for _, i := range staticAllocatedV4 {
+				env.cont.staticServiceIps.V4.AddIp(i)
+			}
+			for _, i := range staticAllocatedV6 {
+				env.cont.staticServiceIps.V6.AddIp(i)
+			}
+		}
+	}()
+
+	// Allocate requested new static IPs
+	for i, _ := range requestedStatic {
+		ipa := &requestedStatic[i]
+		if _, ok := currentStatic[ipa.IP]; ok {
+			continue
+		}
+		ip := net.ParseIP(ipa.IP)
+		if ip == nil {
+			err = fmt.Errorf("Invalid IP requested %s", ipa.IP)
+			return nil, err
+		}
+		if ip.To4() != nil {
+			if !env.cont.staticServiceIps.V4.RemoveIp(ip) {
+				err = fmt.Errorf("Requested IP %s unavailable", ipa.IP)
+				return nil, err
+			}
+			staticAllocatedV4 = append(staticAllocatedV4, ip)
+		} else if ip.To16() != nil {
+			if !env.cont.staticServiceIps.V6.RemoveIp(ip) {
+				err = fmt.Errorf("Requested IP %s unavailable", ipa.IP)
+				return nil, fmt.Errorf("Requested IP %s unavailable", ipa.IP)
+			}
+			staticAllocatedV6 = append(staticAllocatedV6, ip)
+		} else {
+			err = fmt.Errorf("Invalid IP requested %s", ipa.IP)
+			return nil, err
+		}
+	}
+	// remove processed IPs from currentStatic
+	for i, _ := range requestedStatic {
+		delete(currentStatic, requestedStatic[i].IP)
+	}
+
+	
+	if requestedDynamic {
+		// Allocate dynamic IPs and append them to requestedStatic
+		if len(currentDynamic) == 0 {
+			ipv4, _ := env.cont.serviceIps.V4.GetIp()
+			if ipv4 != nil {
+				requestedStatic = append(requestedStatic, ExtIpAlloc{IP: ipv4.String(), Dynamic: true, Pool: ""})
+			}
+			ipv6, _ := env.cont.serviceIps.V6.GetIp()
+			if ipv6 != nil {
+				requestedStatic = append(requestedStatic, ExtIpAlloc{IP: ipv6.String(), Dynamic: true, Pool: ""})
+			}
+			if ipv4 == nil && ipv6 == nil {
+				err = fmt.Errorf("Unable to assign dynamic address")
+				return nil, err
+			}
+		}
+		// Add current dynamic IPs if any
+		for _, ipa := range currentDynamic {
+			requestedStatic = append(requestedStatic, *ipa)
+		}
+	}
+	// At this point new allocations are done, and we don't expect any more errors
+
+	// Return unused static IPs
+	for _, ipa := range currentStatic {
+		ip := net.ParseIP(ipa.IP)
+		if ip != nil && ip.To4() != nil {
+			env.cont.staticServiceIps.V4.AddIp(ip)
+		} else if ip != nil && ip.To16() != nil {
+			env.cont.staticServiceIps.V6.AddIp(ip)
+		}
+	}
+	// Return unused dynamic IPs
+	if !requestedDynamic && len(currentDynamic) > 0 {
+		for _, ipa := range currentDynamic {
+			ip := net.ParseIP(ipa.IP)
+			if ip != nil && ip.To4() != nil {
+				env.cont.serviceIps.V4.AddIp(ip)
+			} else if ip != nil && ip.To16() != nil {
+				env.cont.serviceIps.V6.AddIp(ip)
+			}
+		}
+	}
+	return requestedStatic, nil
 }

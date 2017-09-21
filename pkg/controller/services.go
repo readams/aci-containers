@@ -133,7 +133,7 @@ func returnIps(pool *netIps, ips []net.IP) {
 
 func (cont *AciController) staticServiceObjs() apicapi.ApicSlice {
 	// Service bridge domain
-	bdName := cont.aciNameForKey("bd", "kubernetes-service")
+	bdName := cont.aciNameForKey("bd", cont.env.ServiceBd())
 
 	bd := apicapi.NewFvBD(cont.config.AciVrfTenant, bdName)
 	bd.SetAttr("arpFlood", "yes")
@@ -585,7 +585,7 @@ func (cont *AciController) opflexDeviceChanged(obj apicapi.ApicObject) {
 
 	cont.updateDeviceCluster()
 	for _, node := range nodeUpdates {
-		cont.updateServicesForNode(node)
+		cont.env.NodeServiceChanged(node)
 	}
 }
 
@@ -616,7 +616,7 @@ func (cont *AciController) opflexDeviceDeleted(dn string) {
 
 	cont.updateDeviceCluster()
 	for _, node := range nodeUpdates {
-		cont.updateServicesForNode(node)
+		cont.env.NodeServiceChanged(node)
 	}
 }
 

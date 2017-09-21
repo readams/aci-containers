@@ -151,6 +151,7 @@ type CfEnvironment struct {
 
 	indexLock    sync.Locker
 	epIdx        map[string]etcd.EpInfo
+	appIdx       map[string]etcd.AppInfo
 
 	iptbl        *iptables.IPTables
 	ctPortMap    map[string]map[uint32]uint32
@@ -211,6 +212,7 @@ func NewCfEnvironment(config *HostAgentConfig, log *logrus.Logger) (*CfEnvironme
 func (env *CfEnvironment) Init(agent *HostAgent) error {
 	env.agent = agent
 	env.epIdx = make(map[string]etcd.EpInfo)
+	env.appIdx = make(map[string]etcd.AppInfo)
 	env.ctPortMap = make(map[string]map[uint32]uint32)
 	if env.cfconfig.CfNetOvsPort != "" {
 		env.agent.ignoreOvsPorts[env.agent.config.IntBridgeName] = []string{env.cfconfig.CfNetOvsPort}
@@ -254,14 +256,14 @@ func (env *CfEnvironment) CniDeviceChanged(metadataKey *string, id *md.Container
 		env.log.Debug("No EP info for container ", ctId)
 		return
 	}
-	env.cfAppChanged(&ctId, &ep)
+	env.cfAppContainerChanged(&ctId, &ep)
 }
 
 func (env *CfEnvironment) CniDeviceDeleted(metadataKey *string, id *md.ContainerId) {
-	env.cfAppDeleted(&id.Pod, nil)
+	env.cfAppContainerDeleted(&id.Pod, nil)
 }
 
-func (env *CfEnvironment) cfAppChanged(ctId *string, ep *etcd.EpInfo) {
+func (env *CfEnvironment) cfAppContainerChanged(ctId *string, ep *etcd.EpInfo) {
 	if ep == nil {
 		return
 	}
@@ -341,7 +343,7 @@ func (env *CfEnvironment) updatePreNatRule(ctId *string, ep *etcd.EpInfo, portma
 	env.ctPortMap[*ctId] = new_pm
 }
 
-func (env *CfEnvironment) cfAppDeleted(ctId *string, ep *etcd.EpInfo) {
+func (env *CfEnvironment) cfAppContainerDeleted(ctId *string, ep *etcd.EpInfo) {
 	env.agent.indexMutex.Lock()
 	env.agent.epDeleted(ctId)
 	env.agent.indexMutex.Unlock()
@@ -437,4 +439,71 @@ func (env *CfEnvironment) updateLegacyCfNetService(portmap []etcd.PortMap) error
 		env.agent.syncServices()
 	}
 	return nil
+}
+
+func (env *CfEnvironment) cfAppDeleted(appId *string, app *etcd.AppInfo) {
+	env.agent.indexMutex.Lock()
+	defer env.agent.indexMutex.Unlock()
+	_, ok := env.agent.opflexServices[*appId]
+	if ok {
+		delete(env.agent.opflexServices, *appId)
+		env.agent.syncServices()
+	}
+}
+
+// 0 -> ipv4, 1 -> ipv6, anything else -> invalid IP
+func getIpType(ip_str string) int {
+	ip := net.ParseIP(ip_str)
+	if ip == nil {
+		return -1
+	}
+	if ip.To4() != nil {
+		return 0
+	}
+	if ip.To16() != nil {
+		return 1
+	}
+	return -2
+}
+
+func (env *CfEnvironment) cfAppChanged(appId *string, app *etcd.AppInfo) {
+	if len(app.VirtualIp) == 0 || len(app.ContainerIps) == 0 {
+		return
+	}
+	agent := env.agent
+	appas := opflexService{
+		Uuid:              *appId,
+		DomainPolicySpace: agent.config.AciVrfTenant,
+		DomainName:        agent.config.AciVrf,
+		ServiceMode:       "loadbalancer",
+		ServiceMappings:   make([]opflexServiceMapping, 0),
+	}
+	for _, vip := range app.VirtualIp {
+		ipt := getIpType(vip)
+		if ipt != 0 && ipt != 1 {
+			continue
+		}
+		sm := opflexServiceMapping{
+			ServiceIp:  vip,
+			NextHopIps: make([]string, 0),
+			Conntrack:  true,
+		}
+		for _, cip := range app.ContainerIps {
+			if ipt != getIpType(cip) {
+				continue
+			}
+			sm.NextHopIps = append(sm.NextHopIps, cip)
+		}
+		if len(sm.NextHopIps) > 0 {
+			appas.ServiceMappings = append(appas.ServiceMappings, sm)
+		}
+	}
+
+	agent.indexMutex.Lock()
+	defer agent.indexMutex.Unlock()
+	exist, ok := env.agent.opflexServices[*appId]
+	if !ok || !reflect.DeepEqual(*exist, appas) {
+		env.agent.opflexServices[*appId] = &appas
+		env.agent.syncServices()
+	}
 }

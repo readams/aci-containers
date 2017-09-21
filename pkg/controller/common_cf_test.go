@@ -42,7 +42,14 @@ func testCfEnvironmentNoMigration(t *testing.T) *CfEnvironment {
 	cont := NewController(NewConfig(), &env, log)
 	cont.config.DefaultEg.Name = "default|cf-app-default"
 	cont.config.DefaultEg.PolicySpace = "cf"
-	cont.podNetworkIps.V4.AddRange(net.ParseIP("10.2.3.0"), net.ParseIP("10.2.3.255"))
+	cont.configuredPodNetworkIps.V4.AddRange(net.ParseIP("10.10.0.0"), net.ParseIP("10.10.255.255"))
+	cont.configuredPodNetworkIps.V6.AddRange(net.ParseIP("::fe00"), net.ParseIP("::feff"))
+	cont.nodeServiceIps.V4.AddRange(net.ParseIP("1.0.0.1"), net.ParseIP("1.0.0.24"))
+	cont.nodeServiceIps.V6.AddRange(net.ParseIP("a1::"), net.ParseIP("a1::ff"))
+	cont.staticServiceIps.V4.AddRange(net.ParseIP("1.2.3.1"), net.ParseIP("1.2.3.20"))
+	cont.staticServiceIps.V6.AddRange(net.ParseIP("::2f00"), net.ParseIP("::2fff"))
+	cont.serviceIps.V4.AddRange(net.ParseIP("1.2.4.1"), net.ParseIP("1.2.4.20"))
+	cont.serviceIps.V6.AddRange(net.ParseIP("::2e00"), net.ParseIP("::2eff"))
 	env.cont = cont
 	env.log = log
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -116,7 +123,11 @@ type fakeEtcdKeysApi struct {
 
 
 func (k *fakeEtcdKeysApi) Get(ctx context.Context, key string, opts *etcdclient.GetOptions) (*etcdclient.Response, error) {
-	return nil, fmt.Errorf("Not Implemented")
+	v, ok := k.data[key]
+	if ok {
+		return &etcdclient.Response{Node: &etcdclient.Node{Value: v}}, nil
+	}
+	return nil, etcdclient.Error{Code: etcdclient.ErrorCodeKeyNotFound}
 }
 
 func (k *fakeEtcdKeysApi) Set(ctx context.Context, key, value string, opts *etcdclient.SetOptions) (*etcdclient.Response, error) {
@@ -126,7 +137,8 @@ func (k *fakeEtcdKeysApi) Set(ctx context.Context, key, value string, opts *etcd
 }
 
 func (k *fakeEtcdKeysApi) Delete(ctx context.Context, key string, opts *etcdclient.DeleteOptions) (*etcdclient.Response, error) {
-	return nil, fmt.Errorf("Not Implemented")
+	delete(k.data, key)
+	return nil, nil
 }
 
 func (k *fakeEtcdKeysApi) Create(ctx context.Context, key, value string) (*etcdclient.Response, error) {
@@ -171,4 +183,24 @@ func (k *fakeEtcdKeysApi) GetEpInfo(cell, cont string) *etcd.EpInfo {
 		return &ep
 	}
 	return nil
+}
+
+func (k *fakeEtcdKeysApi) GetAppInfo(appId string) *etcd.AppInfo {
+	key := etcd.APP_KEY_BASE + "/" + appId
+	found, ok := k.data[key]
+	if ok {
+		var app etcd.AppInfo
+		er := json.Unmarshal([]byte(found), &app)
+		if er != nil {
+			panic(er.Error())
+		}
+		return &app
+	}
+	return nil
+}
+
+func txn(db *sql.DB, f func (txn *sql.Tx)) {
+	txn, _ := db.Begin()
+	defer txn.Commit()
+	f(txn)
 }

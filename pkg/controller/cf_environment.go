@@ -36,6 +36,7 @@ import (
 	"github.com/noironetworks/aci-containers/pkg/apicapi"
 	"github.com/noironetworks/aci-containers/pkg/cfapi"
 	"github.com/noironetworks/aci-containers/pkg/etcd"
+	"github.com/noironetworks/aci-containers/pkg/ipam"
 )
 
 type CfEnvironment struct {
@@ -57,6 +58,8 @@ type CfEnvironment struct {
 	asgIdx       map[string]SecurityGroupInfo
 	netpolIdx    map[string]map[string][]cfapi.Destination
 	isoSegIdx    map[string]IsoSegInfo
+
+	appVips      *netIps
 
 	idxStatusChan   chan string
 	log          *logrus.Logger
@@ -99,6 +102,10 @@ type CfConfig struct {
 	SshPort                            string                `json:"ssh_port"`
 
 	DefaultAppProfile                  string                `json:"default_app_profile"`
+
+	// Virtual IP address pool for apps
+	AppVipPool                         []ipam.IpRange        `json:"app_vip_pool,omitempty"`
+	AppVipSubnet                       []string              `json:"app_vip_subnet,omitempty"`
 }
 
 func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironment, error) {
@@ -187,7 +194,17 @@ func NewCfEnvironment(config *ControllerConfig, log *logrus.Logger) (*CfEnvironm
 	return &CfEnvironment{cfconfig: cfconfig, bbsClient: bbsClient,
 						 etcdKeysApi: etcdKeysApi, netpolClient: netpolClient,
 						 cfAuthClient: authClient,
-						 indexLock: &sync.Mutex{}, log: log}, nil
+						 indexLock: &sync.Mutex{}, 
+						 appVips: newNetIps(),
+						 log: log}, nil
+}
+
+func (env *CfEnvironment) VmmPolicy() string {
+	return "CloudFoundry"
+}
+
+func (env *CfEnvironment) ServiceBd() string {
+	return "cf-app-ext-ip"
 }
 
 func (env *CfEnvironment) Init(cont *AciController) error {
@@ -219,6 +236,8 @@ func (env *CfEnvironment) Init(cont *AciController) error {
 	env.netpolIdx = make(map[string]map[string][]cfapi.Destination)
 	env.isoSegIdx = make(map[string]IsoSegInfo)
 
+	cont.loadIpRanges(env.appVips.V4, env.appVips.V6, env.cfconfig.AppVipPool)
+
 	var err error
 	env.db, err = sql.Open(env.cfconfig.DbType, env.cfconfig.DbDsn)
 	if err != nil {
@@ -244,7 +263,9 @@ func (env *CfEnvironment) PrepareRun(stopCh <-chan struct{}) error {
 	}
 
 	epg_anno_handler := EpgAnnotationHttpHandler{env: env}
+	app_vip_handler := AppVipHttpHandler{env: env}
 	http.Handle(epg_anno_handler.Path(), &epg_anno_handler)
+	http.Handle(app_vip_handler.Path(), &app_vip_handler)
 
 	maxattempts := 240                 // TODO move the connect loop to app-index builder
 	for env.ccClient == nil && maxattempts > 0 {
@@ -263,6 +284,8 @@ func (env *CfEnvironment) PrepareRun(stopCh <-chan struct{}) error {
 		env.log.Error("Couldn't create CC API client, aborting: ", err)
 		return err
 	}
+
+	env.LoadAppExtIps()
 
 	appCh := make(chan interface{}, 100)
 	go env.initBbsEventListener(appCh, stopCh)
@@ -289,6 +312,7 @@ func (env *CfEnvironment) PrepareRun(stopCh <-chan struct{}) error {
 
 func (env *CfEnvironment) InitStaticAciObjects() {
 	env.initStaticHpp()
+	env.cont.initStaticServiceObjs()
 }
 
 func (env *CfEnvironment) initStaticHpp() {
@@ -343,19 +367,26 @@ func (env *CfEnvironment) initStaticHpp() {
 	}
 	hpp.AddChild(appSubj)
 
-	// Allow TCP/UDP egress (+ reply) to CNI network
-	if env.cont.config.PodSubnet == "" {
-		env.log.Warning("Pod subnet not defined")
+	// Allow TCP/UDP egress (+ reply) to CNI network and app-VIP network
+	subnets := make([]string, 0)
+	if env.cont.config.PodSubnet != "" {
+		subnets = append(subnets, env.cont.config.PodSubnet)
 	} else {
-		gw, subnet, err := net.ParseCIDR(env.cont.config.PodSubnet)
+		env.log.Warning("Pod subnet not defined")
+	}
+	for _, vip_sn := range env.cfconfig.AppVipSubnet {
+		subnets = append(subnets, vip_sn)
+	}
+	for idx, subnet_str := range subnets {
+		_, subnet, err := net.ParseCIDR(subnet_str)
 		if err != nil {
-			env.log.Warning("Invalid pod subnet: ", err)
+			env.log.Warning(fmt.Sprintf("Invalid subnet %s: ", subnet_str), err)
 		} else {
 			af := "ipv4"
-			if gw.To4() == nil && gw.To16() != nil {
+			if subnet.IP.To4() == nil && subnet.IP.To16() != nil {
 				af = "ipv6"
 			}
-			c2cSubj := apicapi.NewHostprotSubj(hpp.GetDn(), "c2c")
+			c2cSubj := apicapi.NewHostprotSubj(hpp.GetDn(), fmt.Sprintf("c2c-%d", idx))
 			c2cDn := c2cSubj.GetDn()
 			tcp := apicapi.NewHostprotRule(c2cDn, "c2c-tcp")
 			tcp.SetAttr("direction", "egress")
@@ -379,8 +410,86 @@ func (env *CfEnvironment) initStaticHpp() {
 	cont.apicConn.WriteApicObjects(cont.config.AciPrefix + "_asg_static", apicapi.ApicSlice{hpp})
 }
 
+// must be called with cont.indexMutex locked
+func (env *CfEnvironment) LoadCellNetworkInfo(cellId string) {
+	if _, ok := env.cont.nodePodNetCache[cellId]; ok {
+		return
+	}
+	kapi := env.etcdKeysApi
+	cellKey := etcd.CELL_KEY_BASE + "/" + cellId + "/network"
+	resp, err := kapi.Get(context.Background(), cellKey, nil)
+	if err != nil {
+		keyerr, ok := err.(etcdclient.Error)
+		if ok && keyerr.Code == etcdclient.ErrorCodeKeyNotFound {
+			env.log.Info(fmt.Sprintf("Etcd subtree %s doesn't exist yet", cellKey))
+		} else {
+			env.log.Error("Unable to fetch etcd cell network info: ", err)
+		}
+		return
+	}
+	nodePodNet := newNodePodNetMeta()
+	env.cont.nodePodNetCache[cellId] = nodePodNet
+	env.cont.mergePodNet(nodePodNet, resp.Node.Value, logrus.NewEntry(env.log))
+}
+
+// must be called with cont.indexMutex locked
+func (env *CfEnvironment) LoadCellServiceInfo(cellId string) bool {
+	nodeName := "diego-cell-" + cellId
+	if _, ok := env.cont.nodeServiceMetaCache[nodeName]; ok {
+		return false
+	}
+	nodeMeta := &nodeServiceMeta{}
+	kapi := env.etcdKeysApi
+	cellKey := etcd.CELL_KEY_BASE + "/" + cellId + "/service"
+	resp, err := kapi.Get(context.Background(), cellKey, nil)
+	if err != nil {
+		keyerr, ok := err.(etcdclient.Error)
+		if ok && keyerr.Code == etcdclient.ErrorCodeKeyNotFound {
+			env.log.Info(fmt.Sprintf("Etcd subtree %s doesn't exist yet", cellKey))
+		} else {
+			env.log.Error("Unable to fetch etcd cell service info: ", err)
+			return false
+		}
+	} else {
+		err = json.Unmarshal([]byte(resp.Node.Value), &nodeMeta.serviceEp)
+		if err != nil {
+			env.log.Warn("Could not parse cell service info: ", err)
+		}
+	}
+	err = env.cont.createServiceEndpoint(&nodeMeta.serviceEp)
+	if err != nil {
+		env.log.Error("Couldn't create service EP info for cell: ", err)
+		return false
+	}
+	raw, err := json.Marshal(&nodeMeta.serviceEp)
+	if err != nil {
+		env.log.Error("Could not marshal cell service info: ", err)
+	} else {
+		_, err = kapi.Set(context.Background(), cellKey, string(raw), nil)
+		if err != nil {
+			env.log.Error("Error setting etcd service info for cell: ", err)
+		}
+	}
+	if err == nil {
+		env.cont.nodeServiceMetaCache[nodeName] = nodeMeta
+		return true
+	} else {
+		if nodeMeta.serviceEp.Ipv4 != nil {
+			env.cont.nodeServiceIps.V4.AddIp(nodeMeta.serviceEp.Ipv4)
+		}
+		if nodeMeta.serviceEp.Ipv6 != nil {
+			env.cont.nodeServiceIps.V6.AddIp(nodeMeta.serviceEp.Ipv6)
+		}
+	}
+	return false
+}
+
+// must be called with cont.indexMutex locked
 func (env *CfEnvironment) NodePodNetworkChanged(nodename string) {
-	if podnet, ok := env.cont.nodePodNetCache[nodename]; ok {
+	env.cont.indexMutex.Lock()
+	podnet, ok := env.cont.nodePodNetCache[nodename]
+	env.cont.indexMutex.Unlock()
+	if ok {
 		cellKey := etcd.CELL_KEY_BASE + "/" + nodename
 		kapi := env.etcdKeysApi
 		_, err := kapi.Set(context.Background(), cellKey + "/network", podnet.podNetIpsAnnotation, nil)
@@ -388,4 +497,7 @@ func (env *CfEnvironment) NodePodNetworkChanged(nodename string) {
 			env.log.Error("Error setting etcd net info for cell: ", err)
 		}
 	}
+}
+
+func (env *CfEnvironment) NodeServiceChanged(nodeName string) {
 }

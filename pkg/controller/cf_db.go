@@ -33,6 +33,19 @@ func getV0Migration(db *sql.DB, txn *sql.Tx) *migration {
 					value VARCHAR(255),
 					PRIMARY KEY (guid, kind)
 					);`,
+					`CREATE TABLE IF NOT EXISTS aci_app_vip (
+					guid VARCHAR(255) NOT NULL,
+					ip_v4 VARCHAR(16),
+					ip_v6 VARCHAR(64),
+					PRIMARY KEY (guid)
+					);`,
+					`CREATE TABLE IF NOT EXISTS aci_app_ext_ip (
+					guid VARCHAR(255) NOT NULL,
+					ip VARCHAR(64),
+					dynamic INTEGER,
+					pool VARCHAR(255),
+					PRIMARY KEY (guid, ip)
+					);`,
 				  },
 	}
 	return &m

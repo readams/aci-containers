@@ -31,12 +31,6 @@ import (
 	tu "github.com/noironetworks/aci-containers/pkg/testutil"
 )
 
-func txn(db *sql.DB, f func (txn *sql.Tx)) {
-	txn, _ := db.Begin()
-	defer txn.Commit()
-	f(txn)
-}
-
 func doTestAnnoDBForKind(t *testing.T, kind int) {
 	env := testCfEnvironment(t)
 	ea_db := EpgAnnotationDb{}
