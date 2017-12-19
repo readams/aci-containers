@@ -113,6 +113,11 @@
   name = "github.com/mattn/go-sqlite3"
   version = "1.2.0"
 
+[[constraint]]
+  name = "github.com/yl2chen/cidranger"
+  branch = "master"
+  source = "github.com/readams/cidranger"
+
 [[override]]
   name = "github.com/cenkalti/hub"
   branch = "master"

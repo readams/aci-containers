@@ -417,6 +417,13 @@
 
 [[projects]]
   branch = "master"
+  name = "github.com/yl2chen/cidranger"
+  packages = [".","net"]
+  revision = "8c56974d0513150f1d1022d8ecaa8eee52b1f9c5"
+  source = "github.com/readams/cidranger"
+
+[[projects]]
+  branch = "master"
   name = "golang.org/x/crypto"
   packages = ["ssh/terminal"]
   revision = "9419663f5a44be8b34ca85f08abc5fe1be11f8a3"
@@ -508,6 +515,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "df5269c97752ec9b4c145b2b54189e21c35018864cfc098de28b4fe86eafdffa"
+  inputs-digest = "55c3158f7dbe3d8a8cab7e59cb525790d7ff9d21aff0362042bb31874ad2f753"
   solver-name = "gps-cdcl"
   solver-version = 1

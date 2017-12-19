@@ -48,13 +48,13 @@ func (cont *AciController) initEndpointsInformerBase(listWatch *cache.ListWatch)
 		listWatch, &v1.Endpoints{}, 0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				cont.endpointsChanged(obj)
+				cont.endpointsAdded(obj)
 			},
-			UpdateFunc: func(_ interface{}, obj interface{}) {
-				cont.endpointsChanged(obj)
+			UpdateFunc: func(old interface{}, new interface{}) {
+				cont.endpointsUpdated(old, new)
 			},
 			DeleteFunc: func(obj interface{}) {
-				cont.endpointsChanged(obj)
+				cont.endpointsDeleted(obj)
 			},
 		},
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
@@ -96,12 +96,87 @@ func serviceLogger(log *logrus.Logger, as *v1.Service) *logrus.Entry {
 	})
 }
 
-func (cont *AciController) endpointsChanged(obj interface{}) {
+func getEndpointsIps(endpoints *v1.Endpoints) map[string]bool {
+	ips := make(map[string]bool)
+	for _, subset := range endpoints.Subsets {
+		for _, addr := range subset.Addresses {
+			ips[addr.IP] = true
+		}
+		for _, addr := range subset.NotReadyAddresses {
+			ips[addr.IP] = true
+		}
+	}
+	return ips
+}
+
+func (cont *AciController) queueEndpointsNetPolUpdates(ips map[string]bool) {
+	for ipStr, _ := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+		entries, err := cont.netPolSubnetIndex.ContainingNetworks(ip)
+		if err != nil {
+			cont.log.Error("Corrupted network policy IP index")
+			return
+		}
+		for _, entry := range entries {
+			for npkey, _ := range entry.(*ipIndexEntry).keys {
+				cont.queueNetPolUpdateByKey(npkey)
+			}
+		}
+	}
+}
+
+func (cont *AciController) endpointsAdded(obj interface{}) {
+	endpoints := obj.(*v1.Endpoints)
 	servicekey, err := cache.MetaNamespaceKeyFunc(obj.(*v1.Endpoints))
 	if err != nil {
 		cont.log.Error("Could not create service key: ", err)
 		return
 	}
+
+	ips := getEndpointsIps(endpoints)
+	cont.indexMutex.Lock()
+	cont.updateIpIndex(cont.endpointsIpIndex, nil, ips, servicekey)
+	cont.queueEndpointsNetPolUpdates(ips)
+	cont.indexMutex.Unlock()
+	cont.queueServiceUpdateByKey(servicekey)
+}
+
+func (cont *AciController) endpointsDeleted(obj interface{}) {
+	endpoints := obj.(*v1.Endpoints)
+	servicekey, err := cache.MetaNamespaceKeyFunc(endpoints)
+	if err != nil {
+		cont.log.Error("Could not create service key: ", err)
+		return
+	}
+
+	ips := getEndpointsIps(endpoints)
+	cont.indexMutex.Lock()
+	cont.updateIpIndex(cont.endpointsIpIndex, ips, nil, servicekey)
+	cont.queueEndpointsNetPolUpdates(ips)
+	cont.indexMutex.Unlock()
+	cont.queueServiceUpdateByKey(servicekey)
+}
+
+func (cont *AciController) endpointsUpdated(old interface{}, new interface{}) {
+	servicekey, err := cache.MetaNamespaceKeyFunc(new.(*v1.Endpoints))
+	if err != nil {
+		cont.log.Error("Could not create service key: ", err)
+		return
+	}
+
+	oldIps := getEndpointsIps(old.(*v1.Endpoints))
+	newIps := getEndpointsIps(new.(*v1.Endpoints))
+
+	cont.indexMutex.Lock()
+	if !reflect.DeepEqual(oldIps, newIps) {
+		cont.updateIpIndex(cont.endpointsIpIndex, oldIps, newIps, servicekey)
+		cont.queueEndpointsNetPolUpdates(oldIps)
+		cont.queueEndpointsNetPolUpdates(newIps)
+	}
+	cont.indexMutex.Unlock()
 	cont.queueServiceUpdateByKey(servicekey)
 }
 
@@ -757,6 +832,7 @@ func (cont *AciController) allocateServiceIps(servicekey string,
 		ipv4, err := cont.serviceIps.AllocateIp(true)
 		if err != nil {
 			logger.Error("No IP addresses available for service")
+			cont.indexMutex.Unlock()
 			return true
 		} else {
 			meta.ingressIps = []net.IP{ipv4}
