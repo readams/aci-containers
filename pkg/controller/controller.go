@@ -362,11 +362,13 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 		cont.config.AciVrfTenant, cont.config.AciL3Out),
 		[]string{"fvRsCons"})
 	vmmDn := fmt.Sprintf("comp/prov-%s/ctrlr-[%s]-%s/injcont",
-		cont.env.VmmPolicy(), cont.config.AciVmmDomain, cont.config.AciVmmController)
+		cont.env.VmmPolicy(), cont.config.AciVmmDomain,
+		cont.config.AciVmmController)
 	cont.apicConn.AddSubscriptionDn(vmmDn,
 		[]string{"vmmInjectedHost", "vmmInjectedNs",
 			"vmmInjectedContGrp", "vmmInjectedDepl",
-			"vmmInjectedSvc", "vmmInjectedReplSet"})
+			"vmmInjectedSvc", "vmmInjectedReplSet",
+			"vmmInjectedOrg", "vmmInjectedOrgUnit"})
 
 	cont.apicConn.AddSubscriptionClass("opflexODev",
 		[]string{"opflexODev"},

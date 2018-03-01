@@ -30,6 +30,12 @@ func (conn *ApicConnection) apicBodyAttrCmp(class string,
 		conn.log.Warning("No metadata for class ", class)
 		return true
 	}
+	if bodyc.Attributes == nil {
+		bodyc.Attributes = make(map[string]interface{})
+	}
+	if bodyd.Attributes == nil {
+		bodyd.Attributes = make(map[string]interface{})
+	}
 	for p, def := range meta.attributes {
 		ac, ok := bodyc.Attributes[p]
 		if !ok {
@@ -44,6 +50,14 @@ func (conn *ApicConnection) apicBodyAttrCmp(class string,
 			return false
 		}
 	}
+	if class != "tagAnnotation" && class != "tagInst" {
+		annotc, _ := bodyc.Attributes["annotation"]
+		annotd, _ := bodyd.Attributes["annotation"]
+		if annotc != annotd {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -107,9 +121,12 @@ func (conn *ApicConnection) apicObjCmp(current ApicObject,
 			}
 		}
 	}
-	//if update {
-	//	conn.log.Debug(current, desired)
-	//}
+	if update {
+		conn.log.WithFields(logrus.Fields{
+			"current": current,
+			"desired": desired,
+		}).Debug("Update required")
+	}
 	return
 }
 
@@ -182,17 +199,25 @@ func getTagFromKey(prefix string, key string) string {
 }
 
 func PrepareApicSlice(objects ApicSlice, prefix string, key string) ApicSlice {
-	return prepareApicSliceTag(objects, getTagFromKey(prefix, key))
+	return prepareApicSliceTag(objects, getTagFromKey(prefix, key), false)
 }
 
-func prepareApicSliceTag(objects ApicSlice, tag string) ApicSlice {
+func prepareApicSliceTag(objects ApicSlice, tag string,
+	useAPICTag bool) ApicSlice {
+
 	sort.Sort(objects)
 	for _, obj := range objects {
 		for class, body := range obj {
-			if class != "tagInst" {
-				obj.SetTag(tag)
+			if class != "tagInst" && class != "tagAnnotation" {
+				obj.SetTag(tag, useAPICTag)
+				if !useAPICTag {
+					if body.Attributes == nil {
+						body.Attributes = make(map[string]interface{})
+					}
+					body.Attributes["annotation"] = aciContainersOwnerAnnotation
+				}
 			}
-			prepareApicSliceTag(body.Children, tag)
+			prepareApicSliceTag(body.Children, tag, useAPICTag)
 
 			if md, ok := metadata[class]; ok {
 				if md.normalizer != nil {
@@ -301,7 +326,7 @@ func (conn *ApicConnection) removeFromDnIndex(dn string) {
 func (conn *ApicConnection) doWriteApicObjects(key string, objects ApicSlice,
 	container bool) {
 	tag := getTagFromKey(conn.prefix, key)
-	prepareApicSliceTag(objects, tag)
+	prepareApicSliceTag(objects, tag, conn.UseAPICTag)
 
 	conn.indexMutex.Lock()
 	updates, deletes := conn.diffApicState(conn.desiredState[key], objects)
